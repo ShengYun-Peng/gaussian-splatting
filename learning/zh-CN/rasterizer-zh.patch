@@ -1,0 +1,1852 @@
+diff --git a/diff_gaussian_rasterization/__init__.py b/diff_gaussian_rasterization/__init__.py
+--- a/diff_gaussian_rasterization/__init__.py
++++ b/diff_gaussian_rasterization/__init__.py
+@@ -9,15 +9,23 @@
+ # For inquiries contact  george.drettakis@inria.fr
+ #
+ 
++# 中文精读：Python 与 C++/CUDA 之间的自动求导桥接层。
++# 调用链为 GaussianRasterizer.forward → _RasterizeGaussians.apply → _C.rasterize_gaussians。
++# _C 是编译出来的扩展；PyTorch 无法自动追踪 CUDA 内部逐项运算，所以反向需要人工实现。
+ from typing import NamedTuple
+ import torch.nn as nn
+ import torch
+ from . import _C
+ 
++# 把张量搬到 CPU 后克隆，可用于保留故障输入的快照；普通对象直接复用。
++# 这一固定版本的 forward/backward 没有调用这个工具函数，不要误以为每次渲染都会备份。
+ def cpu_deep_copy_tuple(input_tuple):
+     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
+     return tuple(copied_tensors)
+ 
++# 薄包装保留统一的参数顺序；.apply 由 PyTorch 建立自定义算子的求导节点。
++# means3D 是 [P,3] 世界中心；means2D 是用于接收屏幕梯度的占位张量；
++# sh 为 [P,M,3]，颜色可预先算好为 [P,3]；尺度 [P,3]、旋转 [P,4]、协方差 [P,6]。
+ def rasterize_gaussians(
+     means3D,
+     means2D,
+@@ -41,6 +49,10 @@
+         raster_settings,
+     )
+ 
++# 自定义 autograd.Function 的 forward 保存必要状态，backward 返回各输入的梯度。
++# 这里不会从 Python 自动推导 CUDA 程序；反向对应 backward.cu 中手写的链式法则。
++# means2D 没有传给 C++ 前向：真正的二维位置由三维中心和相机计算；
++# 但 backward 会为这个占位输入返回二维梯度，让训练代码用它统计增密依据。
+ class _RasterizeGaussians(torch.autograd.Function):
+     @staticmethod
+     def forward(
+@@ -57,6 +69,9 @@
+     ):
+ 
+         # Restructure arguments the way that the C++ lib expects them
++        # 下面的元组顺序必须严格匹配 rasterize_points.cu 的 C++ 函数签名。
++        # 相机设置从不可变 NamedTuple 展开；它们不作为可训练张量输入返回梯度。
++        # 传入的尺度、不透明度、旋转通常已经分别经过 exp、sigmoid、归一化；此桥接层不重复激活。
+         args = (
+             raster_settings.bg, 
+             means3D,
+@@ -81,15 +96,24 @@
+         )
+ 
+         # Invoke C++/CUDA rasterizer
++        # 七个返回值中只有颜色、半径、逆深度暴露给上层；三个字节缓存留给反向恢复。
++        # num_rendered 是高斯与块的重叠实例总数，一个高斯覆盖多个块会重复计数，不能当可见高斯数。
++        # color=[3,H,W]，radii=[P] 为整数像素半径，invdepths=[1,H,W] 为加权逆深度。
+         num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths = _C.rasterize_gaussians(*args)
+ 
+         # Keep relevant tensors for backward
++        # ctx 保持同一次前向的相机设置与实例数量，save_for_backward 保持张量生命周期。
++        # 缓存含投影、颜色截断掩码、排序结果、最终透射率等；这些量决定本次离散剔除与合成路径。
++        # 这不是把整个计算图存下来，而是保存手写反向所需要的最小一组输入与辅助状态。
+         ctx.raster_settings = raster_settings
+         ctx.num_rendered = num_rendered
+         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer)
+         return color, radii, invdepths
+ 
+     @staticmethod
++    # 三个入参分别对应 forward 的三个输出梯度：颜色、整数半径、逆深度。
++    # 半径来自 ceil/剔除等离散决定，不做可微优化，使用占位名 _ 忽略它。
++    # grad_out_depth 的名字沿用源码，但它实际对应逆深度图，并不是普通 z 深度图。
+     def backward(ctx, grad_out_color, _, grad_out_depth):
+ 
+         # Restore necessary values from context
+@@ -98,6 +122,8 @@
+         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+ 
+         # Restructure args as C++ method expects them
++        # 将缓存与输出梯度交给 CUDA：先按像素逆序合成求二维属性梯度，再传播到三维参数。
++        # 前向的排序与覆盖集合直接复用；这里没有对排序、阈值比较或块编号本身求导。
+         args = (raster_settings.bg,
+                 means3D, 
+                 radii, 
+@@ -126,6 +152,9 @@
+         # Compute gradients for relevant tensors by invoking backward method
+         grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)        
+ 
++        # 返回元组的槽位必须与 .apply 的九个输入逐一一致，不能按 C++ 输出顺序直接返回。
++        # means2D 梯度既服务于三维位置反传的内部链路，也被上层 retain_grad 收集用于增密判断。
++        # 最后 None 表示 raster_settings 这个配置对象没有梯度；本接口也不直接优化相机参数。
+         grads = (
+             grad_means3D,
+             grad_means2D,
+@@ -140,6 +169,9 @@
+ 
+         return grads
+ 
++# 一帧渲染的固定设置：宽高以像素计，tanfovx/y 是半视场角的正切值，不是弧度角。
++# viewmatrix 表示世界到相机，projmatrix 通常是复合投影，campos 是世界坐标下相机中心。
++# sh_degree 控制当前球谐阶数；antialiasing 控制滤波透明度补偿；debug 会引入同步检查。
+ class GaussianRasterizationSettings(NamedTuple):
+     image_height: int
+     image_width: int 
+@@ -160,6 +192,8 @@
+         super().__init__()
+         self.raster_settings = raster_settings
+ 
++    # 这个查询只返回布尔标记，因此放在 no_grad 下，不建立训练梯度。
++    # 固定版本底层主要检测相机前方的近裁剪条件，不能将结果理解成完整遮挡可见性。
+     def markVisible(self, positions):
+         # Mark visible points (based on frustum culling for camera) with a boolean 
+         with torch.no_grad():
+@@ -175,12 +209,19 @@
+         
+         raster_settings = self.raster_settings
+ 
++        # 外观表示必须二选一：让 CUDA 从球谐求颜色，或由上层提供现成 RGB。
++        # 两种都给会让梯度来源不明确，两种都不给则无法着色，因此这里直接报错。
+         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
+         
++        # 几何也必须二选一：完整的尺度+旋转，或预先计算的三维协方差。
++        # 条件同时检查「缺少尺度或旋转」与「预计算协方差和尺度/旋转混用」两类问题。
+         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+         
++        # 未使用的输入用零元素张量占位，便于保持扩展函数固定签名。
++        # 这一版本在 C++ 中依靠空张量的数据指针表示缺失路径；不要把占位张量误当零颜色或零尺度。
++        # 这些空张量默认位于 CPU，但没有元素可供核访问；真实输入则须满足扩展的 CUDA/类型要求。
+         if shs is None:
+             shs = torch.Tensor([])
+         if colors_precomp is None:
+diff --git a/rasterize_points.cu b/rasterize_points.cu
+--- a/rasterize_points.cu
++++ b/rasterize_points.cu
+@@ -9,6 +9,9 @@
+  * For inquiries contact  george.drettakis@inria.fr
+  */
+ 
++// 中文精读：这一层把 PyTorch 张量转换成底层 CUDA 所需的指针，并创建输出/梯度缓冲区。
++// 它不实现高斯公式；真正算法调度在 cuda_rasterizer/rasterizer_impl.cu。
++// 正常调用假定真实输入在兼容的 CUDA 设备上、float32 且形状正确；本版本只做了有限的显式检查。
+ #include <math.h>
+ #include <torch/extension.h>
+ #include <cstdio>
+@@ -24,8 +27,13 @@
+ #include <string>
+ #include <functional>
+ 
++// 生成一个「请求 N 字节显存并返回地址」的回调，底层无需依赖 PyTorch 的具体分配接口。
++// lambda 按引用捕获字节张量，扩容后的 Tensor 仍由外层持有，并在前向结束后返回给 Python 保存。
++// 这里的 N 是字节数，因为三个缓存张量都使用 uint8/Byte 类型。
+ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
+     auto lambda = [&t](size_t N) {
++        // resize_ 原地改变缓存长度；底层拿到连续内存的 char* 后再自行按类型/对齐划分。
++        // 不要对已有前向缓存随意 resize，否则反向保存的几何/排序状态可能失效。
+         t.resize_({(long long)N});
+ 		return reinterpret_cast<char*>(t.contiguous().data_ptr());
+     };
+@@ -33,6 +41,8 @@
+ }
+ 
+ std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++// 前向扩展入口，参数位置必须与 Python args 元组一致。
++// 返回顺序：实例数 R、颜色、半径、几何缓存、排序缓存、像素缓存、逆深度。
+ RasterizeGaussiansCUDA(
+ 	const torch::Tensor& background,
+ 	const torch::Tensor& means3D,
+@@ -55,6 +65,8 @@
+ 	const bool antialiasing,
+ 	const bool debug)
+ {
++  // 这里只显式检查三维中心是二维张量且最后一维为 3。
++  // 不要据此误认为所有输入的 dtype、设备、连续性和形状都已完整验证；调用方需要维持接口约定。
+   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
+     AT_ERROR("means3D must have dimensions (num_points, 3)");
+   }
+@@ -63,9 +75,13 @@
+   const int H = image_height;
+   const int W = image_width;
+ 
++  // 用 means3D 的设备等选项构造输出，并显式选 float32/int32。
++  // int_opts 在这个版本中没有被后续使用，保留它有助于对照原源码，不代表另一路实际分配。
+   auto int_opts = means3D.options().dtype(torch::kInt32);
+   auto float_opts = means3D.options().dtype(torch::kFloat32);
+ 
++  // 颜色形状为 [NUM_CHANNELS,H,W]，逆深度形状最终为 [1,H,W]。
++  // 源码先建零通道逆深度张量，再无条件重新分配单通道版本，所以本版本正常前向总会计算逆深度。
+   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
+   torch::Tensor out_invdepth = torch::full({0, H, W}, 0.0, float_opts);
+   float* out_invdepthptr = nullptr;
+@@ -75,6 +91,8 @@
+ 
+   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+   
++  // 三个缓存使用当前 CUDA 设备；调用者应确保当前设备与输入张量设备一致。
++  // 颜色/半径跟随 means3D.options()，而缓存这里用当前设备，所以多 GPU 场景需要留意这一约定。
+   torch::Device device(torch::kCUDA);
+   torch::TensorOptions options(torch::kByte);
+   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+@@ -84,15 +102,22 @@
+   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
+   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+   
++  // P=0 时跳过底层算法，避免前缀和末项访问及零规模核启动。
++  // 这一分支保留输出初始化的零颜色/零逆深度，不会自动填入非黑背景；这是固定源码的实际行为。
+   int rendered = 0;
+   if(P != 0)
+   {
+ 	  int M = 0;
++	  // 球谐张量非空时 M=sh.size(1)，即每高斯分配的系数数目。
++	  // 若使用预计算颜色，sh 是空占位，M=0，底层不会走球谐着色分支。
+ 	  if(sh.size(0) != 0)
+ 	  {
+ 		M = sh.size(1);
+       }
+ 
++	  // 把张量转连续后取原始指针；底层按 C/CUDA 的扁平数组访问，无需知道 Tensor 对象。
++	  // 颜色、尺度、协方差的空张量对应可选路径；读取非空数据时须满足预期 dtype 和设备。
++	  // 几何缓存的所有权仍在 Tensor，避免手写 CUDA malloc/free 与 Python 生命周期脱节。
+ 	  rendered = CudaRasterizer::Rasterizer::forward(
+ 	    geomFunc,
+ 		binningFunc,
+@@ -124,6 +149,8 @@
+ }
+ 
+ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++ // 反向扩展入口：输入包括原前向张量、图像上游梯度、三个缓存和实例数 R。
++ // 它先创建全零梯度，因为像素核用 atomicAdd 累积，而被剔除/未使用的参数应保持零。
+  RasterizeGaussiansBackwardCUDA(
+  	const torch::Tensor& background,
+ 	const torch::Tensor& means3D,
+@@ -160,6 +187,9 @@
+ 	M = sh.size(1);
+   }
+ 
++  // 梯度形状逐项对齐原参数：中心 [P,3]、颜色 [P,3]、opacity [P,1]、协方差 [P,6]、
++  // 球谐 [P,M,3]、尺度 [P,3]、四元数 [P,4]。二维中心也占 [P,3]，只有 x/y 实际使用。
++  // conic 梯度临时存为 [P,2,2]，传回 Python 的八个结果中不包括这个内部中间梯度。
+   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
+   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
+   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
+@@ -173,6 +203,8 @@
+   
+   float* dL_dinvdepthsptr = nullptr;
+   float* dL_dout_invdepthptr = nullptr;
++  // 只有存在逆深度输出梯度时才分配每高斯逆深度梯度，避免无关分支访问空指针。
++  // 这里判断的是张量是否有通道，不是检测梯度数值是否全零。
+   if(dL_dout_invdepth.size(0) != 0)
+   {
+ 	dL_dinvdepths = torch::zeros({P, 1}, means3D.options());
+@@ -183,6 +215,8 @@
+ 
+   if(P != 0)
+   {  
++	  // 传入的缓存是保存的 uint8 Tensor，reinterpret_cast<char*> 恢复字节地址。
++	  // 底层按前向同样布局还原结构，首先逐像素累积，再逐高斯展开链式法则。
+ 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
+ 	  background.contiguous().data<float>(),
+ 	  W, H, 
+@@ -219,9 +253,13 @@
+ 	  debug);
+   }
+ 
++  // C++ 返回顺序从二维中心梯度开始，与 Python .apply 输入顺序不同。
++  // Python backward 会重新排列这八个梯度并在设置对象处补 None，务必对照两个层次理解。
+   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
+ }
+ 
++// 可见性查询分配 [P] 布尔张量并启动粗筛核；空输入直接返回空结果。
++// 它不渲染图像，也不考虑前景遮挡，具体过滤规则见 auxiliary.h 的 in_frustum。
+ torch::Tensor markVisible(
+ 		torch::Tensor& means3D,
+ 		torch::Tensor& viewmatrix,
+diff --git a/rasterize_points.h b/rasterize_points.h
+--- a/rasterize_points.h
++++ b/rasterize_points.h
+@@ -9,6 +9,10 @@
+  * For inquiries contact  george.drettakis@inria.fr
+  */
+ 
++// 中文精读：声明 PyTorch/C++ 桥接函数，供 ext.cpp 绑定使用。
++// 函数参数名称不会影响 C++ 类型签名，真正调用语义由定义和传参顺序决定。
++// 本版本反向声明中 colors 后的 scales/opacities 名称顺序与 .cu 定义不一致；
++// 它们类型都为 const torch::Tensor&，所以能编译，阅读时应以 .cu 定义与 Python args 为准。
+ #pragma once
+ #include <torch/extension.h>
+ #include <cstdio>
+@@ -16,6 +20,8 @@
+ #include <string>
+ 	
+ std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++// 前向返回七项：R、颜色、半径、几何缓存、排序缓存、像素缓存、逆深度。
++// 三类缓存只为反向提供状态，不是最终图片。
+ RasterizeGaussiansCUDA(
+ 	const torch::Tensor& background,
+ 	const torch::Tensor& means3D,
+@@ -39,6 +45,8 @@
+ 	const bool debug);
+ 
+ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++ // 反向返回八个可训练输入梯度，具体顺序见 .cu 的 make_tuple 与 Python 中的重新排列。
++ // 相机矩阵、背景、FoV、配置和整数半径没有由这个接口输出对应梯度。
+  RasterizeGaussiansBackwardCUDA(
+  	const torch::Tensor& background,
+ 	const torch::Tensor& means3D,
+diff --git a/ext.cpp b/ext.cpp
+--- a/ext.cpp
++++ b/ext.cpp
+@@ -12,8 +12,13 @@
+ #include <torch/extension.h>
+ #include "rasterize_points.h"
+ 
++// 中文精读：pybind11 把三个 C++ 函数注册到 PyTorch 构建出的 _C 模块。
++// Python 调用 _C.rasterize_gaussians 时实际跳到 RasterizeGaussiansCUDA，
++// 后者才完成张量内存分配并调用底层 CUDA 流水线；这里没有自动生成反向公式。
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
++  // 反向函数作为独立入口注册，由 Python autograd.Function.backward 显式调用。
++  // 因此扩展成功导入不代表反向已自动验证，需要结合源码不变性与实际运行检查。
+   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
+   m.def("mark_visible", &markVisible);
+ }
+\ No newline at end of file
+diff --git a/cuda_rasterizer/auxiliary.h b/cuda_rasterizer/auxiliary.h
+--- a/cuda_rasterizer/auxiliary.h
++++ b/cuda_rasterizer/auxiliary.h
+@@ -9,12 +9,17 @@
+  * For inquiries contact  george.drettakis@inria.fr
+  */
+ 
++// 中文精读：前向与反向共享的坐标约定、球谐常数、裁剪工具和归一化导数。
++// 本文件的矩阵索引比函数名字更可靠：4×4 平铺数组按列取值，平移位于 12/13/14。
++// 阅读 Python 相机中的 transpose 与 GLM 构造器时，应始终把这些实际索引作为核对依据。
+ #ifndef CUDA_RASTERIZER_AUXILIARY_H_INCLUDED
+ #define CUDA_RASTERIZER_AUXILIARY_H_INCLUDED
+ 
+ #include "config.h"
+ #include "stdio.h"
+ 
++// BLOCK_SIZE=16×16=256，通常是 8 个 warp；一个渲染块同时服务 256 个候选像素。
++// 球谐常数匹配特定的实球谐基顺序和符号，必须与前向、反向及 Python 实现一致。
+ #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
+ #define NUM_WARPS (BLOCK_SIZE/32)
+ // Spherical harmonics coefficients
+@@ -37,11 +42,17 @@
+ 	-0.5900435899266435f
+ };
+ 
++// 把归一化坐标 v 映射为像素中心坐标：v=-1 → -0.5，v=1 → S-0.5。
++// 因此整数像素位置 0,...,S-1 对应位于图像边界内半个像素的中心。
++// 导数为 S/2，这正是反向渲染中 ddelx_dx、ddely_dy 的来源。
+ __forceinline__ __device__ float ndc2Pix(float v, int S)
+ {
+ 	return ((v + 1.0) * S - 1.0) * 0.5;
+ }
+ 
++// 用中心与保守半径估计覆盖块的半开矩形，结果限制在 [0,grid.x]×[0,grid.y]。
++// 最小/最大坐标是块下标，不是像素下标；范围为空表示不影响任何屏幕块。
++// 这里直接使用整数转换与边界裁剪，是源码的具体离散规则，不能与连续几何边界等同。
+ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
+ {
+ 	rect_min = {
+@@ -54,6 +65,8 @@
+ 	};
+ }
+ 
++// 重载版本允许横纵使用不同半径；当前核心前向使用前一个圆半径版本。
++// 两种版本都只负责生成候选矩形，不逐块做精确的椭圆相交测试。
+ __forceinline__ __device__ void getRect(const float2 p, int2 ext_rect, uint2& rect_min, uint2& rect_max, dim3 grid)
+ {
+ 	rect_min = {
+@@ -67,6 +80,8 @@
+ }
+ 
+ 
++// 计算仿射点变换 t=R·p+t0：点的齐次第四分量视为 1，所以必须加平移。
++// 索引 0/4/8 构成输出 x 的三项；这里的 4x3 表示取 4×4 变换的前三个输出分量。
+ __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
+ {
+ 	float3 transformed = {
+@@ -77,6 +92,8 @@
+ 	return transformed;
+ }
+ 
++// 完整齐次变换保留 w，用于后续透视除法。
++// 此函数本身不除以 w，也不判断是否在可见范围；调用者明确完成这两步。
+ __forceinline__ __device__ float4 transformPoint4x4(const float3& p, const float* matrix)
+ {
+ 	float4 transformed = {
+@@ -88,6 +105,8 @@
+ 	return transformed;
+ }
+ 
++// 方向向量没有位置平移，所以这里只乘线性旋转部分。
++// 与点变换相比唯一但关键的差异就是去掉 matrix[12/13/14]。
+ __forceinline__ __device__ float3 transformVec4x3(const float3& p, const float* matrix)
+ {
+ 	float3 transformed = {
+@@ -98,6 +117,8 @@
+ 	return transformed;
+ }
+ 
++// 反向传播的梯度是协向量：若 t=R·p+t0，则 dL/dp=Rᵀ·dL/dt。
++// 本函数专门做这个转置乘法，不是把相机点位置逆变换回世界坐标。
+ __forceinline__ __device__ float3 transformVec4x3Transpose(const float3& p, const float* matrix)
+ {
+ 	float3 transformed = {
+@@ -108,6 +129,8 @@
+ 	return transformed;
+ }
+ 
++// 对单位化 v/||v|| 做向量-雅可比积后，只取关于原始 v.z 的导数。
++// 统一公式为 (I/||v|| - vvᵀ/||v||³)·dv；下面逐分量展开它。
+ __forceinline__ __device__ float dnormvdz(float3 v, float3 dv)
+ {
+ 	float sum2 = v.x * v.x + v.y * v.y + v.z * v.z;
+@@ -116,6 +139,9 @@
+ 	return dnormvdz;
+ }
+ 
++// 输入 dv 是对归一化结果的上游梯度，输出是对归一化前 v 的梯度。
++// 归一化会消去径向变化，只保留切向方向变化；分母 ||v||³ 来自商法则。
++// 此实现没有零长度保护，因此调用方必须保证向量非零。
+ __forceinline__ __device__ float3 dnormvdv(float3 v, float3 dv)
+ {
+ 	float sum2 = v.x * v.x + v.y * v.y + v.z * v.z;
+@@ -128,6 +154,9 @@
+ 	return dnormvdv;
+ }
+ 
++// 四维版本适用于四元数归一化，数学结构与三维相同。
++// 当前固定版本的 computeCov3D 把 CUDA 内部四元数归一化及其反传注释掉了；
++// 因此这个工具的存在不代表当前旋转梯度会在 CUDA 中通过它。
+ __forceinline__ __device__ float4 dnormvdv(float4 v, float4 dv)
+ {
+ 	float sum2 = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+@@ -143,11 +172,16 @@
+ 	return dnormvdv;
+ }
+ 
++// 标准 sigmoid 可把实数变到 (0,1)；正常渲染的不透明度通常已在 Python 激活。
++// 这个辅助函数并没有在当前核心前向中再次作用到 opacity。
+ __forceinline__ __device__ float sigmoid(float x)
+ {
+ 	return 1.0f / (1.0f + expf(-x));
+ }
+ 
++// 粗筛：读取中心，求相机坐标及投影坐标，实际生效的条件仅为 p_view.z>0.2。
++// 横纵视锥检查在 if 后的原注释中被禁用；画外椭圆随后由块矩形裁剪处理。
++// 此函数也不判断高斯是否被其他高斯遮挡，不能等同于最终图像中的可见贡献。
+ __forceinline__ __device__ bool in_frustum(int idx,
+ 	const float* orig_points,
+ 	const float* viewmatrix,
+@@ -165,6 +199,8 @@
+ 
+ 	if (p_view.z <= 0.2f)// || ((p_proj.x < -1.3 || p_proj.x > 1.3 || p_proj.y < -1.3 || p_proj.y > 1.3)))
+ 	{
++		// prefiltered 表示调用方承诺输入已满足这层过滤；若仍落在近裁剪面后，就触发 GPU trap。
++		// 这不是自动开启额外滤波，而是对前置过滤约定的一种检查。
+ 		if (prefiltered)
+ 		{
+ 			printf("Point is filtered although prefiltered is set. This shouldn't happen!");
+@@ -175,6 +211,9 @@
+ 	return true;
+ }
+ 
++// 宏先执行 A；debug=true 时 cudaDeviceSynchronize 强制同步并检查错误。
++// 常规模式避免每一步同步以提高性能，因此异步错误可能到更晚的 CUDA 调用才暴露。
++// 宏中的反斜线用于续行；学习时不要把注释放在反斜线后面，避免破坏预处理。
+ #define CHECK_CUDA(A, debug) \
+ A; if(debug) { \
+ auto ret = cudaDeviceSynchronize(); \
+diff --git a/cuda_rasterizer/backward.cu b/cuda_rasterizer/backward.cu
+--- a/cuda_rasterizer/backward.cu
++++ b/cuda_rasterizer/backward.cu
+@@ -9,6 +9,10 @@
+  * For inquiries contact  george.drettakis@inria.fr
+  */
+ 
++// 中文精读：此文件把图像损失对颜色/逆深度的梯度，逆向传回每个高斯的可学习属性。
++// 主要路径：像素损失 → α/颜色/二维中心/逆协方差 → 三维中心/协方差 → 尺度/旋转/球谐。
++// 反向复用前向确定的覆盖、排序和阈值路径，不对这些离散决策自身求导。
++// 阅读时 dL_dx 表示标量总损失 L 对 x 的导数，而不是 x 的前向数值。
+ #include "backward.h"
+ #include "auxiliary.h"
+ #include <cooperative_groups.h>
+@@ -20,10 +24,15 @@
+ 
+ // Backward pass for conversion of spherical harmonics to RGB for
+ // each Gaussian.
++// 球谐反向包含两条链：颜色对系数的导数，以及颜色对观察方向再对三维中心的导数。
++// 每个基函数 Y_k(d) 对其系数的导数就是 Y_k(d)，因此系数梯度很直接。
++// 方向梯度需要逐项对 x/y/z 的多项式求导，再通过单位向量归一化反传。
+ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
+ {
+ 	// Compute intermediate values, as it is done during forward
+ 	glm::vec3 pos = means[idx];
++	// 保留归一化前的方向与长度；只缓存单位方向不足以求回对原始位置的正确梯度。
++	// 相机位置在这个接口中视为固定量，所以这里只向高斯中心累积导数。
+ 	glm::vec3 dir_orig = pos - campos;
+ 	glm::vec3 dir = dir_orig / glm::length(dir_orig);
+ 
+@@ -31,11 +40,15 @@
+ 
+ 	// Use PyTorch rule for clamping: if clamping was applied,
+ 	// gradient becomes 0.
++	// 前向颜色 max(c,0) 的被截断通道在这里清零梯度。
++	// 掩码来自同一次前向缓存；未截断通道继续传播，结果恰好为零时采用源码指定的未截断分支。
+ 	glm::vec3 dL_dRGB = dL_dcolor[idx];
+ 	dL_dRGB.x *= clamped[3 * idx + 0] ? 0 : 1;
+ 	dL_dRGB.y *= clamped[3 * idx + 1] ? 0 : 1;
+ 	dL_dRGB.z *= clamped[3 * idx + 2] ? 0 : 1;
+ 
++	// 三个 vec3 分别存 RGB 三通道对方向分量 x/y/z 的导数。
++	// 它们不是三个颜色值，而是颜色函数的三个偏导向量；最终与上游 RGB 梯度点乘。
+ 	glm::vec3 dRGBdx(0, 0, 0);
+ 	glm::vec3 dRGBdy(0, 0, 0);
+ 	glm::vec3 dRGBdz(0, 0, 0);
+@@ -47,10 +60,14 @@
+ 	glm::vec3* dL_dsh = dL_dshs + idx * max_coeffs;
+ 
+ 	// No tricks here, just high school-level calculus.
++	// 零阶颜色与方向无关，只影响系数梯度，不贡献位置梯度。
++	// 同一个标量基值分别乘 R/G/B 的上游梯度，得到这个系数的三个可学习分量梯度。
+ 	float dRGBdsh0 = SH_C0;
+ 	dL_dsh[0] = dRGBdsh0 * dL_dRGB;
+ 	if (deg > 0)
+ 	{
++		// 一阶基函数顺序继续与前向一致：(-y,z,-x)。
++		// 系数梯度使用基值本身；方向导数则取出对应系数，并乘基函数对该方向分量的导数。
+ 		float dRGBdsh1 = -SH_C1 * y;
+ 		float dRGBdsh2 = SH_C1 * z;
+ 		float dRGBdsh3 = -SH_C1 * x;
+@@ -67,6 +84,8 @@
+ 			float xx = x * x, yy = y * y, zz = z * z;
+ 			float xy = x * y, yz = y * z, xz = x * z;
+ 
++			// 二阶五个系数的导数仍只是各自基值，和当前系数数值无关。
++			// 例如 Y_4=C·xy，则 ∂Y_4/∂x=C·y、∂Y_4/∂y=C·x，下面 dRGBdx/dy 正在累加这类项。
+ 			float dRGBdsh4 = SH_C2[0] * xy;
+ 			float dRGBdsh5 = SH_C2[1] * yz;
+ 			float dRGBdsh6 = SH_C2[2] * (2.f * zz - xx - yy);
+@@ -78,12 +97,16 @@
+ 			dL_dsh[7] = dRGBdsh7 * dL_dRGB;
+ 			dL_dsh[8] = dRGBdsh8 * dL_dRGB;
+ 
++			// 多个基函数都依赖同一方向分量，因此使用 += 累加所有路径。
++			// 注意 2z² 项对 z 的导数是 4z；系数的符号和乘二关系必须逐项与前向核对。
+ 			dRGBdx += SH_C2[0] * y * sh[4] + SH_C2[2] * 2.f * -x * sh[6] + SH_C2[3] * z * sh[7] + SH_C2[4] * 2.f * x * sh[8];
+ 			dRGBdy += SH_C2[0] * x * sh[4] + SH_C2[1] * z * sh[5] + SH_C2[2] * 2.f * -y * sh[6] + SH_C2[4] * 2.f * -y * sh[8];
+ 			dRGBdz += SH_C2[1] * y * sh[5] + SH_C2[2] * 2.f * 2.f * z * sh[6] + SH_C2[3] * x * sh[7];
+ 
+ 			if (deg > 2)
+ 			{
++				// 三阶同理，先求七个基值以写系数梯度，再对七个三次多项式分别求方向偏导。
++				// 这段长公式没有额外数值算法，主要是乘积法则；可用有限差分抽查任一方向分量。
+ 				float dRGBdsh9 = SH_C3[0] * y * (3.f * xx - yy);
+ 				float dRGBdsh10 = SH_C3[1] * xy * z;
+ 				float dRGBdsh11 = SH_C3[2] * y * (4.f * zz - xx - yy);
+@@ -99,6 +122,8 @@
+ 				dL_dsh[14] = dRGBdsh14 * dL_dRGB;
+ 				dL_dsh[15] = dRGBdsh15 * dL_dRGB;
+ 
++				// 例如 y(3x²-y²) 对 x 的导数为 6xy；x(4z²-x²-y²) 对 x 为 4z²-3x²-y²。
++				// 后面的 dRGBdy/dz 是同一组基函数对其他方向的偏导，每项都乘其 RGB 系数。
+ 				dRGBdx += (
+ 					SH_C3[0] * sh[9] * 3.f * 2.f * xy +
+ 					SH_C3[1] * sh[10] * yz +
+@@ -130,20 +155,29 @@
+ 	// The view direction is an input to the computation. View direction
+ 	// is influenced by the Gaussian's mean, so SHs gradients
+ 	// must propagate back into 3D position.
++	// 链式法则：dL/dx = Σ通道 (dL/dRGB通道)*(dRGB通道/dx)，y/z 同理。
++	// 点乘把三通道影响汇总成一个方向分量梯度，再交给单位化的雅可比。
+ 	glm::vec3 dL_ddir(glm::dot(dRGBdx, dL_dRGB), glm::dot(dRGBdy, dL_dRGB), glm::dot(dRGBdz, dL_dRGB));
+ 
+ 	// Account for normalization of direction
++	// 单位化的导数为 (I/||v||-vvᵀ/||v||³)；它去掉径向分量并按距离缩放。
++	// 因此改变高斯中心不仅会移动屏幕足迹，也会改变视角相关颜色，两条路径都应贡献位置梯度。
+ 	float3 dL_dmean = dnormvdv(float3{ dir_orig.x, dir_orig.y, dir_orig.z }, float3{ dL_ddir.x, dL_ddir.y, dL_ddir.z });
+ 
+ 	// Gradients of loss w.r.t. Gaussian means, but only the portion 
+ 	// that is caused because the mean affects the view-dependent color.
+ 	// Additional mean gradient is accumulated in below methods.
++	// 这里必须累加：同一三维中心已有协方差、投影位置、可能的逆深度梯度。
++	// 此核按高斯并行，一个线程处理一个高斯，因此这一步不需要 atomicAdd。
+ 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
+ }
+ 
+ // Backward version of INVERSE 2D covariance matrix computation
+ // (due to length launched as separate kernel before other 
+ // backward steps contained in preprocess)
++// 第一阶段预处理反向：把逆二维协方差的梯度变为原二维协方差梯度，
++// 再传到三维协方差与中心；中心影响投影雅可比，所以即使只改变椭圆形状也有位置梯度。
++// 这段单独发一个核，后面的 preprocessCUDA 再补齐屏幕中心和球谐等其他路径。
+ __global__ void computeCov2DCUDA(int P,
+ 	const float3* means,
+ 	const int* radii,
+@@ -160,6 +194,8 @@
+ 	bool antialiasing)
+ {
+ 	auto idx = cg::this_grid().thread_rank();
++	// 只处理前向实际保留的高斯；半径为零的项没有参与像素贡献，保留初始零梯度。
++	// 半径本身是离散的支持范围标志，此处不计算「半径如何随参数变化」的导数。
+ 	if (idx >= P || !(radii[idx] > 0))
+ 		return;
+ 
+@@ -169,6 +205,9 @@
+ 	// Fetch gradients, recompute 2D covariance and relevant 
+ 	// intermediate forward results needed in the backward.
+ 	float3 mean = means[idx];
++	// 反向渲染把 2×2 对称逆协方差梯度存到四槽中的 x/y/w，即索引 0/1/3。
++	// y 保存按单个对称矩阵位置计算的非对角梯度，后面的公式会显式处理两份对称贡献。
++	// 不能只看 float3 就直接与前向 conic 的三参数梯度逐元素等同。
+ 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
+ 	float3 t = transformPoint4x3(mean, view_matrix);
+ 	
+@@ -179,6 +218,8 @@
+ 	t.x = min(limx, max(-limx, txtz)) * t.z;
+ 	t.y = min(limy, max(-limy, tytz)) * t.z;
+ 	
++	// 与前向的视角范围截断相配，越界时对应 x 或 y 的梯度乘零。
++	// 这是源码采用的分段导数；在精确边界上不可微，代码选择内部侧的值。
+ 	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
+ 	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
+ 
+@@ -196,6 +237,8 @@
+ 		cov3D[1], cov3D[3], cov3D[4],
+ 		cov3D[2], cov3D[4], cov3D[5]);
+ 
++	// 重新计算 W、J、Σ 及其投影，减少前向必须保留的中间张量数量。
++	// 重新计算的矩阵约定要与 forward.cu 完全一致，尤其 GLM 构造器是按列填充。
+ 	glm::mat3 T = W * J;
+ 
+ 	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
+@@ -205,6 +248,9 @@
+ 	float c_xy = cov2D[0][1];
+ 	float c_yy = cov2D[1][1];
+ 	
++	// 前向不论是否开启 antialiasing 都给对角线加 0.3，这里必须重复同样处理。
++	// 若开启补偿，还需把有效不透明度 o_eff=o*sqrt(detΣ/det(Σ+hI)) 的梯度拆成两条：
++	// 一条传给原 opacity，另一条通过行列式比值传给协方差。
+ 	constexpr float h_var = 0.3f;
+ 	float d_inside_root = 0.f;
+ 	if(antialiasing)
+@@ -214,6 +260,9 @@
+ 		c_yy += h_var;
+ 		const float det_cov_plus_h_cov = c_xx * c_yy - c_xy * c_xy;
+ 		const float h_convolution_scaling = sqrt(max(0.000025f, det_cov / det_cov_plus_h_cov)); // max for numerical stability
++		// dL_dopacity 此时其实是像素核得到的 dL/do_eff；先保存它才能计算两条支路。
++		// 对原 opacity 的导数乘补偿系数；对补偿系数的导数乘原 opacity。
++		// 当根号内比值被最小值截断时，该比值方向的导数置零。
+ 		const float dL_dopacity_v = dL_dopacity[idx];
+ 		const float d_h_convolution_scaling = dL_dopacity_v * opacities[idx];
+ 		dL_dopacity[idx] = dL_dopacity_v * h_convolution_scaling;
+@@ -232,6 +281,10 @@
+ 	{
+ 		// https://www.wolframalpha.com/input?i=d+%28%28x*y+-+z%5E2%29%2F%28%28x%2Bw%29*%28y%2Bw%29+-+z%5E2%29%29+%2Fdx
+ 		// https://www.wolframalpha.com/input?i=d+%28%28x*y+-+z%5E2%29%2F%28%28x%2Bw%29*%28y%2Bw%29+-+z%5E2%29%29+%2Fdz
++		// 版本细节：此处 c_xx/c_yy 在上面的分支中已经加过 h_var，下面又代入带 w 的比值导数式。
++		// 直接对前向 detΣ/det(Σ+hI) 求导时，通常应明确区分未滤波与已滤波的对角元素。
++		// 因此这里应按固定源码理解，不能把它无条件宣称为该前向公式的精确解析导数；
++		// 若研究抗锯齿梯度，应单独用有限差分核查这一处，本学习副本不修改原有计算。
+ 		const float x = c_xx;
+ 		const float y = c_yy;
+ 		const float z = c_xy;
+@@ -247,6 +300,8 @@
+ 	
+ 	float denom = c_xx * c_yy - c_xy * c_xy;
+ 
++	// 逆矩阵的导数含行列式平方的倒数；分母额外加 1e-7 是数值稳定近似。
++	// 它避免过小分母，但也意味着这里与理想代数公式并不在所有输入上严格相等。
+ 	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
+ 
+ 	if (denom2inv != 0)
+@@ -255,6 +310,9 @@
+ 		// given gradients of loss w.r.t. conic matrix (inverse covariance matrix).
+ 		// e.g., dL / da = dL / d_conic_a * d_conic_a / d_a
+ 		
++		// 令 Σ=[[a,b],[b,c]]，逆矩阵为 [[c,-b],[-b,a]]/(ac-b²)。
++		// 下面逐项展开 ∂L/∂a、∂L/∂b、∂L/∂c，并累加前面抗锯齿补偿产生的梯度。
++		// 非对角的两份对称位置通过系数 2 计入，所以要与像素核中 0.5 的储存约定一起读。
+ 		dL_dc_xx += denom2inv * (-c_yy * c_yy * dL_dconic.x + 2 * c_xy * c_yy * dL_dconic.y + (denom - c_xx * c_yy) * dL_dconic.z);
+ 		dL_dc_yy += denom2inv * (-c_xx * c_xx * dL_dconic.z + 2 * c_xx * c_xy * dL_dconic.y + (denom - c_xx * c_yy) * dL_dconic.x);
+ 		dL_dc_xy += denom2inv * 2 * (c_xy * c_yy * dL_dconic.x - (denom + 2 * c_xy * c_xy) * dL_dconic.y + c_xx * c_xy * dL_dconic.z);
+@@ -262,6 +320,9 @@
+ 		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry,
+ 		// given gradients w.r.t. 2D covariance matrix (diagonal).
+ 		// cov2D = transpose(T) * transpose(Vrk) * T;
++		// 把 Σ屏幕=TᵀΣ世界T 的梯度传回三维协方差的六个压缩分量。
++		// 先写 xx/yy/zz 三个对角项，每项由二维 a/b/c 的上游梯度线性组合而成。
++		// T 的两列对应屏幕横纵投影方向，因此可以把长公式看成若干外积的逐元素展开。
+ 		dL_dcov[6 * idx + 0] = (T[0][0] * T[0][0] * dL_dc_xx + T[0][0] * T[1][0] * dL_dc_xy + T[1][0] * T[1][0] * dL_dc_yy);
+ 		dL_dcov[6 * idx + 3] = (T[0][1] * T[0][1] * dL_dc_xx + T[0][1] * T[1][1] * dL_dc_xy + T[1][1] * T[1][1] * dL_dc_yy);
+ 		dL_dcov[6 * idx + 5] = (T[0][2] * T[0][2] * dL_dc_xx + T[0][2] * T[1][2] * dL_dc_xy + T[1][2] * T[1][2] * dL_dc_yy);
+@@ -270,6 +331,8 @@
+ 		// given gradients w.r.t. 2D covariance matrix (off-diagonal).
+ 		// Off-diagonal elements appear twice --> double the gradient.
+ 		// cov2D = transpose(T) * transpose(Vrk) * T;
++		// 再写 xy/xz/yz 三个非对角独立参数；每个参数同时影响矩阵中的两个对称位置。
++		// 因此这里会出现乘二或两个交叉乘积相加，不能简单复制对角公式。
+ 		dL_dcov[6 * idx + 1] = 2 * T[0][0] * T[0][1] * dL_dc_xx + (T[0][0] * T[1][1] + T[0][1] * T[1][0]) * dL_dc_xy + 2 * T[1][0] * T[1][1] * dL_dc_yy;
+ 		dL_dcov[6 * idx + 2] = 2 * T[0][0] * T[0][2] * dL_dc_xx + (T[0][0] * T[1][2] + T[0][2] * T[1][0]) * dL_dc_xy + 2 * T[1][0] * T[1][2] * dL_dc_yy;
+ 		dL_dcov[6 * idx + 4] = 2 * T[0][2] * T[0][1] * dL_dc_xx + (T[0][1] * T[1][2] + T[0][2] * T[1][1]) * dL_dc_xy + 2 * T[1][1] * T[1][2] * dL_dc_yy;
+@@ -282,6 +345,9 @@
+ 
+ 	// Gradients of loss w.r.t. upper 2x3 portion of intermediate matrix T
+ 	// cov2D = transpose(T) * transpose(Vrk) * T;
++	// 协方差投影对 T 也有梯度，因为 T=WJ 中 J 随中心深度和位置变化。
++	// 六个 dL_dT 分量对应真正参与二维投影的两列三行；未使用方向无需展开。
++	// 这一步确保移动中心时椭圆大小与形状的变化也能推动训练。
+ 	float dL_dT00 = 2 * (T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_dc_xx +
+ 	(T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_dc_xy;
+ 	float dL_dT01 = 2 * (T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_dc_xx +
+@@ -297,20 +363,28 @@
+ 
+ 	// Gradients of loss w.r.t. upper 3x2 non-zero entries of Jacobian matrix
+ 	// T = W * J
++	// 由 T=WJ 反传得到 dL/dJ=Wᵀ(dL/dT)，相机旋转 W 本身在此固定。
++	// 只有 fx/z、fy/z、-fx*x/z²、-fy*y/z² 四个非零雅可比元素需要继续求中心导数。
+ 	float dL_dJ00 = W[0][0] * dL_dT00 + W[0][1] * dL_dT01 + W[0][2] * dL_dT02;
+ 	float dL_dJ02 = W[2][0] * dL_dT00 + W[2][1] * dL_dT01 + W[2][2] * dL_dT02;
+ 	float dL_dJ11 = W[1][0] * dL_dT10 + W[1][1] * dL_dT11 + W[1][2] * dL_dT12;
+ 	float dL_dJ12 = W[2][0] * dL_dT10 + W[2][1] * dL_dT11 + W[2][2] * dL_dT12;
+ 
++	// 缓存 1/z、1/z²、1/z³，避免长公式重复除法。
++	// 例如 ∂(fx/z)/∂z=-fx/z²，∂(-fx*x/z²)/∂z=2fx*x/z³。
+ 	float tz = 1.f / t.z;
+ 	float tz2 = tz * tz;
+ 	float tz3 = tz2 * tz;
+ 
+ 	// Gradients of loss w.r.t. transformed Gaussian mean t
++	// 这是中心影响投影协方差这一支的相机坐标梯度。
++	// x/y 路径带上前面的截断掩码；z 方向同时影响两个焦距缩放和两个透视交叉项。
+ 	float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
+ 	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
+ 	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
+ 	// Account for inverse depth gradients
++	// 逆深度 q=1/z，所以 dq/dz=-1/z²；像素核累积的 dL/dq 由此转换成深度梯度。
++	// 它与协方差引起的位置梯度在相机空间相加，随后一次旋转转置映射回世界空间。
+ 	if (dL_dinvdepth)
+ 	dL_dtz -= dL_dinvdepth[idx] / (t.z * t.z);
+ 
+@@ -322,14 +396,20 @@
+ 	// Gradients of loss w.r.t. Gaussian means, but only the portion 
+ 	// that is caused because the mean affects the covariance matrix.
+ 	// Additional mean gradient is accumulated in BACKWARD::preprocess.
++	// 这是位置梯度的第一段，因此用赋值写入；后续 preprocessCUDA 与球谐反向再使用 +=。
++	// 这个执行顺序解释了为何两个预处理核不能在没有依赖保证时随意并行。
+ 	dL_dmeans[idx] = dL_dmean;
+ }
+ 
+ // Backward pass for the conversion of scale and rotation to a 
+ // 3D covariance matrix for each Gaussian. 
++// 三维协方差反向：已知 dL/dΣ，沿 Σ=MᵀM、M=S*R 回传到尺度与四元数。
++// 正常训练的尺度来自 Python exp，旋转来自 Python normalize；这些上层激活的梯度由 PyTorch 接续。
+ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const glm::vec4 rot, const float* dL_dcov3Ds, glm::vec3* dL_dscales, glm::vec4* dL_drots)
+ {
+ 	// Recompute (intermediate) results for the 3D covariance computation.
++	// 与前向相同，当前 CUDA 不做四元数归一化；注释掉的除法不参与实际运行。
++	// 因此最后输出的是对传入四元数的梯度；若它是 Python 归一化的结果，会继续经过该归一化节点。
+ 	glm::vec4 q = rot;// / glm::length(rot);
+ 	float r = q.x;
+ 	float x = q.y;
+@@ -357,6 +437,8 @@
+ 	glm::vec3 ounc = 0.5f * glm::vec3(dL_dcov3D[1], dL_dcov3D[2], dL_dcov3D[4]);
+ 
+ 	// Convert per-element covariance loss gradients to matrix form
++	// 压缩协方差中一个非对角参数代表两个对称矩阵项；展开梯度矩阵时各分一半。
++	// 这样与矩阵微分中的 Frobenius 内积匹配，避免在 dL/dM=2M(dL/dΣ) 中重复计算。
+ 	glm::mat3 dL_dSigma = glm::mat3(
+ 		dL_dcov3D[0], 0.5f * dL_dcov3D[1], 0.5f * dL_dcov3D[2],
+ 		0.5f * dL_dcov3D[1], dL_dcov3D[3], 0.5f * dL_dcov3D[4],
+@@ -365,6 +447,8 @@
+ 
+ 	// Compute loss gradient w.r.t. matrix M
+ 	// dSigma_dM = 2 * M
++	// Σ=MᵀM 的微分包含 dMᵀM 与 MᵀdM 两项；当上游矩阵梯度对称时合并为 2M·梯度。
++	// 这一步是尺度与旋转梯度的共同来源，下面再按 M=S*R 分流。
+ 	glm::mat3 dL_dM = 2.0f * M * dL_dSigma;
+ 
+ 	glm::mat3 Rt = glm::transpose(R);
+@@ -372,15 +456,22 @@
+ 
+ 	// Gradients of loss w.r.t. scale
+ 	glm::vec3* dL_dscale = dL_dscales + idx;
++	// 点积取出对应尺度方向的梯度；这里源码没有在最终写出的尺度梯度上再显式乘 mod。
++	// 若 scale_modifier≠1，严格链式法则还应核对 s=mod*scale 这一层的因子；
++	// 训练默认 mod=1 时这个区别消失，学习或数值梯度检查时不要忽略该前提。
+ 	dL_dscale->x = glm::dot(Rt[0], dL_dMt[0]);
+ 	dL_dscale->y = glm::dot(Rt[1], dL_dMt[1]);
+ 	dL_dscale->z = glm::dot(Rt[2], dL_dMt[2]);
+ 
++	// 旋转梯度需要乘相应尺度，因为 M=S*R 中每一行受到该方向尺度的调制。
++	// 前面的转置让代码可用 GLM 的列访问表达这些行运算。
+ 	dL_dMt[0] *= s.x;
+ 	dL_dMt[1] *= s.y;
+ 	dL_dMt[2] *= s.z;
+ 
+ 	// Gradients of loss w.r.t. normalized quaternion
++	// 把旋转矩阵九项对四元数四分量的导数逐项展开，累积出 dL/dr、dL/dx、dL/dy、dL/dz。
++	// 公式里的 2 和 4 来自四元数旋转矩阵的二次项；分量顺序仍为实部在前。
+ 	glm::vec4 dL_dq;
+ 	dL_dq.x = 2 * z * (dL_dMt[0][1] - dL_dMt[1][0]) + 2 * y * (dL_dMt[2][0] - dL_dMt[0][2]) + 2 * x * (dL_dMt[1][2] - dL_dMt[2][1]);
+ 	dL_dq.y = 2 * y * (dL_dMt[1][0] + dL_dMt[0][1]) + 2 * z * (dL_dMt[2][0] + dL_dMt[0][2]) + 2 * r * (dL_dMt[1][2] - dL_dMt[2][1]) - 4 * x * (dL_dMt[2][2] + dL_dMt[1][1]);
+@@ -389,12 +480,16 @@
+ 
+ 	// Gradients of loss w.r.t. unnormalized quaternion
+ 	float4* dL_drot = (float4*)(dL_drots + idx);
++	// 末尾 dnormvdv 也被注释掉了，实际直接返回 dL_dq。
++	// 保留原样是为了忠实解释本版本；不能仅凭上方英文「unnormalized quaternion」理解实际行为。
+ 	*dL_drot = float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w };//dnormvdv(float4{ rot.x, rot.y, rot.z, rot.w }, float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w });
+ }
+ 
+ // Backward pass of the preprocessing steps, except
+ // for the covariance computation and inversion
+ // (those are handled by a previous kernel call)
++// 第二阶段预处理反向：补齐投影中心梯度、球谐颜色梯度，以及尺度/旋转梯度。
++// 它接在 computeCov2DCUDA 之后执行，已有的三维中心梯度必须保留并相加。
+ template<int C>
+ __global__ void preprocessCUDA(
+ 	int P, int D, int M,
+@@ -429,6 +524,9 @@
+ 	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
+ 	// from rendering procedure
+ 	glm::vec3 dL_dmean;
++	// 对齐次除法 x_ndc=X/W 使用商法则：d(X/W)=dX/W-X*dW/W²，y 同理。
++	// mul1/mul2 预先缓存 X/W²、Y/W²；下面三行分别对世界 x/y/z 求导。
++	// 这里输入的 dL_dmean2D 已在像素核乘过 W图像/2、H图像/2，因此按归一化坐标继续链式法则。
+ 	float mul1 = (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
+ 	float mul2 = (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
+ 	dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dmean2D[idx].x + (proj[1] * m_w - proj[3] * mul2) * dL_dmean2D[idx].y;
+@@ -440,15 +538,22 @@
+ 	dL_dmeans[idx] += dL_dmean;
+ 
+ 	// Compute gradient updates due to computing colors from SHs
++	// 只有使用球谐路径时才把 RGB 梯度传回球谐系数和视角方向。
++	// 若调用者提供预计算颜色，该颜色梯度在 Python 侧沿其计算图继续传播。
+ 	if (shs)
+ 		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
+ 
+ 	// Compute gradient updates due to computing covariance from scale/rotation
++	// 只有使用尺度+旋转路径时才在 CUDA 展开协方差梯度。
++	// 若上层已经计算 cov3D，六个协方差梯度直接交回上层自动求导，避免重复展开。
+ 	if (scales)
+ 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
+ }
+ 
+ // Backward version of the rendering procedure.
++// 反向渲染仍按「块负责屏幕块、线程负责像素」组织，但改为从远到近遍历。
++// 像素线程将贡献累加到共享的高斯参数梯度，因此必须使用原子加法避免线程间写入丢失。
++// 逆序遍历可从最终 T 恢复每一步透射率，不必存储像素×高斯数量级的中间状态。
+ template <uint32_t C>
+ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+ renderCUDA(
+@@ -497,14 +602,21 @@
+ 
+ 	// In the forward, we stored the final value for T, the
+ 	// product of all (1 - alpha) factors. 
++	// 前向最终透射率 T_final=Π(1-α)；反向接受一项后用 T/=(1-α) 撤销该项。
++	// 恢复出的 T 就是该高斯之前的透射率 T_i，颜色对其自身颜色的导数是 α_i*T_i。
+ 	const float T_final = inside ? final_Ts[pix_id] : 0;
+ 	float T = T_final;
+ 
+ 	// We start from the back. The ID of the last contributing
+ 	// Gaussian is known from each pixel from the forward.
++	// 列表遍历从末尾开始，contributor 每检查一项先减一。
++	// last_contributor 是前向最后合成项的一基位置，所以 contributor>=last_contributor 的项都应跳过。
+ 	uint32_t contributor = toDo;
+ 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
+ 
++	// accum_rec 保存当前高斯后方已经重建的合成颜色，暂不包括背景项。
++	// last_alpha/last_color 保存上一次反向访问的那一层，下一步将它纳入后方颜色。
++	// 逆深度使用同样的递推结构，因为它也按 α*T 加权。
+ 	float accum_rec[C] = { 0 };
+ 	float dL_dpixel[C];
+ 	float dL_invdepth;
+@@ -524,6 +636,8 @@
+ 
+ 	// Gradient of pixel coordinate w.r.t. normalized 
+ 	// screen-space viewport corrdinates (-1 to 1)
++	// 像素位置 u=(ndc+1)*W/2-0.5，所以 ∂u/∂ndc=W/2，纵向同理。
++	// 因此返回的 means2D.x/y 梯度按归一化屏幕坐标缩放；不能直接当作纯像素坐标导数比较。
+ 	const float ddelx_dx = 0.5 * W;
+ 	const float ddely_dy = 0.5 * H;
+ 
+@@ -536,6 +650,8 @@
+ 		const int progress = i * BLOCK_SIZE + block.thread_rank();
+ 		if (range.x + progress < range.y)
+ 		{
++			// 共享内存批次也按逆序装载，保证每个像素看到的顺序与前向完全相反。
++			// 一个批次内颜色按 [通道,批内编号] 布局，便于线程协作搬运后供每个像素复用。
+ 			const int coll_id = point_list[range.y - progress - 1];
+ 			collected_id[block.thread_rank()] = coll_id;
+ 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+@@ -566,10 +682,15 @@
+ 				continue;
+ 
+ 			const float G = exp(power);
++			// 重算与前向相同的 power、G、alpha 和阈值；仅对前向接受的项继续反传。
++			// 版本细节：虽然前向对 alpha 截顶，下面并没有在饱和区显式乘 min 的零导数。
++			// 因此饱和部分采用了近似反向，不能期待对所有输入都通过严格有限差分检查。
+ 			const float alpha = min(0.99f, con_o.w * G);
+ 			if (alpha < 1.0f / 255.0f)
+ 				continue;
+ 
++			// 撤销当前层透射因子，恢复 T_i；alpha≤0.99 保证分母至少 0.01。
++			// 恢复过程会有浮点误差，但比存储每个像素所有中间 T 节省很多显存。
+ 			T = T / (1.f - alpha);
+ 			const float dchannel_dcolor = alpha * T;
+ 
+@@ -582,6 +703,9 @@
+ 			{
+ 				const float c = collected_colors[ch * BLOCK_SIZE + j];
+ 				// Update last color (to be used in the next iteration)
++				// 递推 C后方 = α上一层*c上一层 + (1-α上一层)*C更后方。
++				// 当前 α 增大一方面增加当前颜色，另一方面遮住后方颜色，因此导数含 c当前-C后方。
++				// 等各通道汇总后再乘 T_i，同时还需单独补上背景的遮挡导数。
+ 				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+ 				last_color[ch] = c;
+ 
+@@ -590,12 +714,16 @@
+ 				// Update the gradients w.r.t. color of the Gaussian. 
+ 				// Atomic, since this pixel is just one of potentially
+ 				// many that were affected by this Gaussian.
++				// 一个高斯通常覆盖很多像素，多个线程同时写同一个颜色梯度，atomicAdd 保证加法不丢项。
++				// 浮点原子加法的实际执行顺序可变化，因此运行结果可能存在很小的非确定性舍入差异。
+ 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+ 			}
+ 			// Propagate gradients from inverse depth to alphaas and
+ 			// per Gaussian inverse depths
+ 			if (dL_dinvdepths)
+ 			{
++			// 逆深度与颜色共享合成权重，所以同时贡献 dL/dα 和 dL/d(1/z)。
++			// 这里累计的是每个高斯的逆深度梯度；稍后 computeCov2DCUDA 再乘 -1/z² 转成中心深度梯度。
+ 			const float invd = 1.f / collected_depths[j];
+ 			accum_invdepth_rec = last_alpha * last_invdepth + (1.f - last_alpha) * accum_invdepth_rec;
+ 			last_invdepth = invd;
+@@ -603,6 +731,8 @@
+ 			atomicAdd(&(dL_dinvdepths[global_id]), dchannel_dcolor * dL_invdepth);
+ 			}
+ 
++			// 至此 c当前-C后方 已按各输出通道上游梯度求和，乘 T_i 完成当前 α 的前景导数。
++			// last_alpha 更新后供下一次更靠前的高斯重建其后方颜色使用。
+ 			dL_dalpha *= T;
+ 			// Update last alpha (to be used in the next iteration)
+ 			last_alpha = alpha;
+@@ -612,10 +742,14 @@
+ 			float bg_dot_dpixel = 0;
+ 			for (int i = 0; i < C; i++)
+ 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
++			// 背景项为 T_final*背景色；∂T_final/∂α_i=-T_final/(1-α_i)。
++			// 因此即使当前颜色与后方前景相同，改变 α 仍可能通过遮挡背景影响损失。
+ 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+ 
+ 
+ 			// Helpful reusable temporary variables
++			// 除去饱和近似后，α=o_eff*G，所以 dL/dG=o_eff*dL/dα、dL/do_eff=G*dL/dα。
++			// G=exp(-0.5*dᵀQd)，对位移的导数为 -G*Qd，下面 gdx/gdy 是公共乘积。
+ 			const float dL_dG = con_o.w * dL_dalpha;
+ 			const float gdx = G * d.x;
+ 			const float gdy = G * d.y;
+@@ -623,20 +757,29 @@
+ 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+ 
+ 			// Update gradients w.r.t. 2D mean position of the Gaussian
++			// 位置梯度先由 G 对 d 求导，再乘从归一化坐标到像素的 W/2、H/2。
++			// 二维占位张量有三个分量，但这里只更新 x/y；z 维不代表相机深度梯度。
+ 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+ 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+ 
+ 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
++			// 这些是逆协方差 Q 的梯度，尽管原英文写作 covariance，实际不要混淆 Σ 与 Σ⁻¹。
++			// Qxx/Qyy 的导数分别带 -0.5*dx²、-0.5*dy²；对称非对角项各存半份 -0.5*dx*dy。
++			// 在 computeCov2DCUDA 中会合并两个对称位置，因此这里 y 槽的 0.5 不是漏掉交叉项。
+ 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+ 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+ 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+ 
+ 			// Update gradients w.r.t. opacity of the Gaussian
++			// 这里先得到对有效不透明度 o_eff 的梯度；若抗锯齿开启，后续还要拆出原 opacity 与滤波因子。
++			// 多个像素的贡献仍用原子加法求和，输出缓冲区必须在启动核前清零。
+ 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+ 		}
+ 	}
+ }
+ 
++// 宿主侧按依赖顺序启动两个预处理核：先写入协方差/中心基础梯度，再补其余路径。
++// 默认 CUDA 流中的顺序执行保证第二个核能读取并累加第一个核的结果。
+ void BACKWARD::preprocess(
+ 	int P, int D, int M,
+ 	const float3* means3D,
+@@ -711,6 +854,8 @@
+ 		dL_dopacity);
+ }
+ 
++// 此包装函数只把参数交给编译期固定通道数的反向核。
++// 返回梯度张量的内存分配与初始化在 rasterize_points.cu，自动求导输入顺序映射在 Python 桥接层。
+ void BACKWARD::render(
+ 	const dim3 grid, const dim3 block,
+ 	const uint2* ranges,
+diff --git a/cuda_rasterizer/backward.h b/cuda_rasterizer/backward.h
+--- a/cuda_rasterizer/backward.h
++++ b/cuda_rasterizer/backward.h
+@@ -18,8 +18,12 @@
+ #define GLM_FORCE_CUDA
+ #include <glm/glm.hpp>
+ 
++// 中文精读：反向先 render 再 preprocess，顺序与前向计算链相反。
++// render 从每像素梯度累计二维属性梯度；preprocess 再将这些梯度映射回三维可训练参数。
+ namespace BACKWARD
+ {
++	// 每像素逆序遍历前向贡献者，通过原子加法把梯度归并到每个高斯。
++	// dL_dconic2D 是逆协方差的梯度；dL_dinvdepths 是每高斯的逆深度梯度。
+ 	void render(
+ 		const dim3 grid, dim3 block,
+ 		const uint2* ranges,
+@@ -40,6 +44,8 @@
+ 		float* dL_dcolors,
+ 		float* dL_dinvdepths);
+ 
++	// 先反传协方差投影/求逆与逆深度，再补投影中心/球谐/尺度旋转。
++	// 传入协方差可能是上层预计算值，也可能是前向内部缓存；路径选择必须与前向一致。
+ 	void preprocess(
+ 		int P, int D, int M,
+ 		const float3* means,
+diff --git a/cuda_rasterizer/config.h b/cuda_rasterizer/config.h
+--- a/cuda_rasterizer/config.h
++++ b/cuda_rasterizer/config.h
+@@ -12,6 +12,9 @@
+ #ifndef CUDA_RASTERIZER_CONFIG_H_INCLUDED
+ #define CUDA_RASTERIZER_CONFIG_H_INCLUDED
+ 
++// 中文精读：这里是编译期配置，修改后必须重编译扩展。
++// 默认三通道 RGB；16×16 的屏幕块对应 256 线程，也决定共享内存批次大小。
++// 改变通道数会影响颜色布局、模板实例与缓冲区，不能当作运行时任意参数调整。
+ #define NUM_CHANNELS 3 // Default 3, RGB
+ #define BLOCK_X 16
+ #define BLOCK_Y 16
+diff --git a/cuda_rasterizer/forward.cu b/cuda_rasterizer/forward.cu
+--- a/cuda_rasterizer/forward.cu
++++ b/cuda_rasterizer/forward.cu
+@@ -9,6 +9,11 @@
+  * For inquiries contact  george.drettakis@inria.fr
+  */
+ 
++// 中文精读：本文件负责「一个三维高斯 → 屏幕椭圆 → 像素颜色」的前向过程。
++// 阅读顺序：computeCov3D → computeCov2D → preprocessCUDA → renderCUDA。
++// P 表示高斯数，D 表示当前球谐阶数，M 表示每个高斯分配的球谐系数总数；
++// 例如 D=3 需要 (3+1)^2=16 个系数，每个系数又有 R/G/B 三个分量。
++// 这里没有优化器：输入已经由上层激活成物理量，输出和中间缓存供反向传播使用。
+ #include "forward.h"
+ #include "auxiliary.h"
+ #include <cooperative_groups.h>
+@@ -17,15 +22,24 @@
+ 
+ // Forward method for converting the input spherical harmonics
+ // coefficients of each Gaussian to a simple RGB color.
++// 球谐颜色：c(d)=0.5+Σ_k SH_k(d)·系数_k；同一高斯从不同方向看可呈现不同颜色。
++// 每个 CUDA 线程调用此函数处理一个高斯，glm::vec3 同时承载三个颜色通道。
++// 这里的方向是「相机指向高斯」，请勿改成反方向：奇数阶球谐会因此改变符号。
+ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
+ {
+ 	// The implementation is loosely based on code for 
+ 	// "Differentiable Point-Based Radiance Fields for 
+ 	// Efficient View Synthesis" by Zhang et al. (2022)
+ 	glm::vec3 pos = means[idx];
++	// 先做世界坐标下的向量差，再单位化；球谐只依赖方向，不依赖距离。
++	// 归一化也意味着颜色梯度会沿方向这条路径传回高斯中心；backward.cu 有对应链式法则。
++	// 源码没有为零长度方向加保护，正常渲染依赖有效的相机与可见高斯位置。
+ 	glm::vec3 dir = pos - campos;
+ 	dir = dir / glm::length(dir);
+ 
++	// 连续存储按 [高斯编号, 系数编号, RGB] 排列，转换指针后每次跨过三个 float。
++	// idx*max_coeffs 跳到当前高斯的全部球谐系数；即使当前阶数较低，分配容量也可能更大。
++	// 0 阶常数项控制基础颜色，后面的分支逐步增加 1/2/3 阶方向细节。
+ 	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
+ 	glm::vec3 result = SH_C0 * sh[0];
+ 
+@@ -34,10 +48,14 @@
+ 		float x = dir.x;
+ 		float y = dir.y;
+ 		float z = dir.z;
++		// 一阶基函数在本实现中的顺序为 (-y, z, -x)，乘各自 RGB 系数后加总。
++		// 不要用另一份球谐库的顺序直接替换；Python utils/sh_utils.py 与这里的约定必须一致。
+ 		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+ 
+ 		if (deg > 1)
+ 		{
++			// 二阶的五个基函数是 xy、yz、2z²-x²-y²、xz、x²-y²，前面的常数负责归一化。
++			// 预先缓存平方与交叉项，避免后续多次重复乘法；三阶还会复用这些量。
+ 			float xx = x * x, yy = y * y, zz = z * z;
+ 			float xy = x * y, yz = y * z, xz = x * z;
+ 			result = result +
+@@ -47,6 +65,8 @@
+ 				SH_C2[3] * xz * sh[7] +
+ 				SH_C2[4] * (xx - yy) * sh[8];
+ 
++			// 三阶增加七个三次多项式，因此累计系数数目为 1+3+5+7=16。
++			// 分支只读取当前激活阶数对应的系数，未激活的高阶系数此时不参与图像生成。
+ 			if (deg > 2)
+ 			{
+ 				result = result +
+@@ -60,10 +80,14 @@
+ 			}
+ 		}
+ 	}
++	// 加 0.5 与上层 RGB2SH 的中心化约定配套；它不是 sigmoid，也不把颜色限制到 [0,1]。
++	// 下面只截断负颜色，因此大于 1 的颜色仍可保留，后续图像保存可能另外做截断。
+ 	result += 0.5f;
+ 
+ 	// RGB colors are clamped to positive values. If values are
+ 	// clamped, we need to keep track of this for the backward pass.
++	// 记录每通道是否在截断前小于零，反向时这些通道的颜色梯度会乘零。
++	// 该掩码必须对应本次前向的输入，不能在参数更新之后重新猜测。
+ 	clamped[3 * idx + 0] = (result.x < 0);
+ 	clamped[3 * idx + 1] = (result.y < 0);
+ 	clamped[3 * idx + 2] = (result.z < 0);
+@@ -71,14 +95,22 @@
+ }
+ 
+ // Forward version of 2D covariance matrix computation
++// 三维协方差投影：数学上是 Σ屏幕 = J投影 · W相机 · Σ世界 · W相机ᵀ · J投影ᵀ。
++// 透视投影是非线性的，这里用高斯中心处的一阶雅可比，把局部三维椭球近似成二维椭圆。
++// 返回只存对称矩阵的三个独立量 (a,b,c)，对应 [[a,b],[b,c]]，单位是像素²。
+ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
+ {
+ 	// The following models the steps outlined by equations 29
+ 	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
+ 	// Additionally considers aspect / scaling of viewport.
+ 	// Transposes used to account for row-/column-major conventions.
++	// t 是相机坐标，x/y 是横纵方向，z 是沿相机前方的深度。
++	// 随后计算的焦距 focal_x/focal_y 用像素为单位，因此得到的协方差自然处于像素坐标系。
+ 	float3 t = transformPoint4x3(mean, viewmatrix);
+ 
++	// 限制 x/z、y/z 的范围，避免画面边缘或画外点产生过大的透视雅可比。
++	// 1.3 是扩大视野边界的经验系数；这里限制的是协方差计算中的局部投影，
++	// 不会把真正的高斯中心坐标移到边界，中心投影仍由 preprocessCUDA 的 p_proj 决定。
+ 	const float limx = 1.3f * tan_fovx;
+ 	const float limy = 1.3f * tan_fovy;
+ 	const float txtz = t.x / t.z;
+@@ -86,11 +118,16 @@
+ 	t.x = min(limx, max(-limx, txtz)) * t.z;
+ 	t.y = min(limy, max(-limy, tytz)) * t.z;
+ 
++	// 透视投影 u=fx*x/z、v=fy*y/z，所以非零导数是 fx/z、fy/z、-fx*x/z²、-fy*y/z²。
++	// glm::mat3 构造参数按列填充，源码里的 J 存的是常见纸面雅可比的转置形式。
++	// 理解后面的 W*J 和 transpose(T) 时必须连同这一存储约定一起看，不能只按打印顺序读矩阵。
+ 	glm::mat3 J = glm::mat3(
+ 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
+ 		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+ 		0, 0, 0);
+ 
++	// 这里只取世界到相机变换的旋转部分；平移影响中心 t，不直接改变协方差。
++	// viewmatrix 使用辅助函数中的索引约定，W 在 GLM 中同样按相应转置形式组装。
+ 	glm::mat3 W = glm::mat3(
+ 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
+ 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
+@@ -98,11 +135,15 @@
+ 
+ 	glm::mat3 T = W * J;
+ 
++	// 三维对称协方差压缩为 [xx,xy,xz,yy,yz,zz] 六个 float；这里展开回 3×3。
++	// Vrk 理论上对称，因此转置不改变数学值；代码保留 transpose 是为了统一约定。
+ 	glm::mat3 Vrk = glm::mat3(
+ 		cov3D[0], cov3D[1], cov3D[2],
+ 		cov3D[1], cov3D[3], cov3D[4],
+ 		cov3D[2], cov3D[4], cov3D[5]);
+ 
++	// T 组合相机旋转与投影雅可比，再用 TᵀΣT 得到局部屏幕协方差。
++	// 第三个投影方向设置成零，只需要左上角 2×2；返回值没有包含后面添加的低通滤波方差。
+ 	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
+ 
+ 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
+@@ -111,6 +152,9 @@
+ // Forward method for converting scale and rotation properties of each
+ // Gaussian to a 3D covariance matrix in world space. Also takes care
+ // of quaternion normalization.
++// 用三个正尺度与单位四元数构造半正定协方差，比直接学习六个矩阵项更容易保持合法。
++// 数学上可写作 R diag(s²) Rᵀ；源码由于 GLM 构造约定写成 M=S*R、Σ=MᵀM。
++// scale_modifier 是额外的整体尺寸系数，正常训练通常为 1，查看器可用它改变视觉尺寸。
+ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
+ {
+ 	// Create scaling matrix
+@@ -120,6 +164,9 @@
+ 	S[2][2] = mod * scale.z;
+ 
+ 	// Normalize quaternion to get valid rotation
++	// 注意原英文注释与实际执行不完全一致：/glm::length(rot) 已被注释，CUDA 此处没有归一化！
++	// 正常调用由 Python 的 get_rotation 提供已归一化四元数；直接调用扩展时应自己满足这个前提。
++	// 分量排列为 (实部 r, 虚部 x, y, z)，虽然 GLM 字段名依次叫 q.x/q.y/q.z/q.w。
+ 	glm::vec4 q = rot;// / glm::length(rot);
+ 	float r = q.x;
+ 	float x = q.y;
+@@ -136,9 +183,13 @@
+ 	glm::mat3 M = S * R;
+ 
+ 	// Compute 3D world covariance matrix Sigma
++	// 任意 M 的 MᵀM 都是半正定矩阵；尺度为正且非零时通常正定。
++	// 把尺度先平方再旋转与这种乘法形式等价，但必须使用匹配的矩阵方向和四元数约定。
+ 	glm::mat3 Sigma = glm::transpose(M) * M;
+ 
+ 	// Covariance is symmetric, only store upper right
++	// 只保存六个独立元素，节省每个高斯的缓存与带宽。
++	// 之后的前向投影、反向梯度以及 Python strip_symmetric 都要遵守相同排列。
+ 	cov3D[0] = Sigma[0][0];
+ 	cov3D[1] = Sigma[0][1];
+ 	cov3D[2] = Sigma[0][2];
+@@ -148,6 +199,8 @@
+ }
+ 
+ // Perform initial steps for each Gaussian prior to rasterization.
++// 预处理核：一条线程负责一个高斯，生成供分块排序与像素渲染使用的紧凑属性。
++// 它不遍历像素；高斯可能影响哪些像素块只由二维包围盒估计，真正的指数权重稍后逐像素算。
+ template<int C>
+ __global__ void preprocessCUDA(int P, int D, int M,
+ 	const float* orig_points,
+@@ -176,28 +229,39 @@
+ 	bool prefiltered,
+ 	bool antialiasing)
+ {
++	// 全局线程编号对应高斯编号；最后一个线程块可能超出 P，立即返回防止越界。
++	// cg::this_grid().thread_rank() 在这里用于编号，并未进行跨线程块的全局同步。
+ 	auto idx = cg::this_grid().thread_rank();
+ 	if (idx >= P)
+ 		return;
+ 
+ 	// Initialize radius and touched tiles to 0. If this isn't changed,
+ 	// this Gaussian will not be processed further.
++	// 先标记为「不参与」：任何后续早退都会保持半径和覆盖块数为零。
++	// 这让后续扫描、复制和反向核无需为不同剔除原因分别维护标志。
+ 	radii[idx] = 0;
+ 	tiles_touched[idx] = 0;
+ 
+ 	// Perform near culling, quit if outside.
+ 	float3 p_view;
++	// 这一版本的 in_frustum 实际主要检查相机深度 z>0.2；横纵裁剪条件在源码中被注释了。
++	// 是否落到画面范围最终还需看 getRect 裁剪后的块数，不能把该函数当完整视锥测试。
+ 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+ 		return;
+ 
+ 	// Transform point by projecting
+ 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
++	// projmatrix 在上层通常已包含世界到相机与投影的复合变换。
++	// 先得到齐次坐标 (x,y,z,w)，再除以 w 得到归一化设备坐标；1e-7 用来缓和除零问题。
++	// 后面 ndc2Pix 才把横纵坐标从大致 [-1,1] 换算到像素中心约定。
+ 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+ 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+ 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+ 
+ 	// If 3D covariance matrix is precomputed, use it, otherwise compute
+ 	// from scaling and rotation parameters. 
++	// 协方差有两条互斥路径：上层已计算就直接读取；否则在 CUDA 用尺度和旋转构造。
++	// 选哪条路径会改变反向梯度在哪里展开，但最终应描述同一个三维高斯。
+ 	const float* cov3D;
+ 	if (cov3D_precomp != nullptr)
+ 	{
+@@ -212,6 +276,9 @@
+ 	// Compute 2D screen-space covariance matrix
+ 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+ 
++	// 给二维协方差两个对角线都加 0.3 像素²，相当于与一个小的各向同性高斯滤波核卷积。
++	// 它避免投影极小的高斯退化成比像素还尖锐的信号，并改善求逆稳定性。
++	// 注意：无论 antialiasing 是否启用，这个低通扩宽都会发生；开关控制的是下面的透明度补偿。
+ 	constexpr float h_var = 0.3f;
+ 	const float det_cov = cov.x * cov.z - cov.y * cov.y;
+ 	cov.x += h_var;
+@@ -219,6 +286,9 @@
+ 	const float det_cov_plus_h_cov = cov.x * cov.z - cov.y * cov.y;
+ 	float h_convolution_scaling = 1.0f;
+ 
++	// 扩宽后椭圆面积随 sqrt(detΣ) 增大，因此乘 sqrt(detΣ原/detΣ扩宽) 降低峰值，
++	// 用于近似保持二维高斯的积分质量；没有该补偿时只扩宽而不降低峰值。
++	// 比值最小截到 0.000025，再开平方；这也是反向需要匹配的分段函数。
+ 	if(antialiasing)
+ 		h_convolution_scaling = sqrt(max(0.000025f, det_cov / det_cov_plus_h_cov)); // max for numerical stability
+ 
+@@ -228,18 +298,26 @@
+ 	if (det == 0.0f)
+ 		return;
+ 	float det_inv = 1.f / det;
++	// 2×2 对称矩阵的逆为 1/(ac-b²)·[[c,-b],[-b,a]]。
++	// conic=(A,B,C) 储存逆协方差三个独立量，稍后指数为 -0.5*(A*dx²+2B*dx*dy+C*dy²)。
++	// 这里检查 det==0 后早退；并非一般性的数值合法性验证，调用者仍应提供有限且合理的输入。
+ 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+ 
+ 	// Compute extent in screen space (by finding eigenvalues of
+ 	// 2D covariance matrix). Use extent to compute a bounding rectangle
+ 	// of screen-space tiles that this Gaussian overlaps with. Quit if
+ 	// rectangle covers 0 tiles. 
++	// 二维特征值为 (a+c)/2 ± sqrt(((a-c)/2)²+b²)。最大特征值的平方根是最长主轴标准差。
++	// 代码用 ceil(3*sqrt(λmax)) 构造保守圆半径，再覆盖椭圆的矩形块范围。
++	// 根号内至少取 0.1 是实现中的稳定性/保守估计；它会使半径不同于精确特征值公式。
+ 	float mid = 0.5f * (cov.x + cov.z);
+ 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+ 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+ 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+ 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+ 	uint2 rect_min, rect_max;
++	// getRect 给出半开区间 [rect_min,rect_max)，每个块含 BLOCK_X×BLOCK_Y 个像素。
++	// 包围盒会包含椭圆外的像素或块，所以「覆盖块」只是候选集合；后续权重阈值还会跳过贡献。
+ 	getRect(point_image, my_radius, rect_min, rect_max, grid);
+ 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+ 		return;
+@@ -255,6 +333,8 @@
+ 	}
+ 
+ 	// Store some useful helper data for the next steps.
++	// 排序使用相机空间中心深度，而不是欧氏距离，也不是每个像素光线与椭球表面的交点深度。
++	// 同一个高斯在一个视图内共用此深度；这是速度与表达能力之间的重要实现取舍。
+ 	depths[idx] = p_view.z;
+ 	radii[idx] = my_radius;
+ 	points_xy_image[idx] = point_image;
+@@ -262,6 +342,8 @@
+ 	float opacity = opacities[idx];
+ 
+ 
++	// 把 A、B、C 与有效不透明度打包成 float4，像素核一次读取四个相关标量。
++	// 这里的 opacity 已经是激活后的数值，通常来自 Python sigmoid；此处不会再次 sigmoid。
+ 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity * h_convolution_scaling };
+ 
+ 
+@@ -271,6 +353,9 @@
+ // Main rasterization method. Collaboratively works on one tile per
+ // block, each thread treats one pixel. Alternates between fetching 
+ // and rasterizing data.
++// 渲染核：一个 CUDA block 负责一个屏幕块，一个线程负责其中一个像素。
++// 块内线程共同搬运同一批高斯到共享内存，再让每个像素复用这些数据，减少显存读取。
++// point_list 已按「块编号优先、中心深度从近到远」排序，不能随意改变遍历顺序。
+ template <uint32_t CHANNELS>
+ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+ renderCUDA(
+@@ -293,15 +378,21 @@
+ 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+ 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+ 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
++	// pix_id 是图像平面内的线性位置；最终颜色写成 [通道,高度,宽度] 的通道优先布局。
++	// 网格为覆盖整幅图而向上取整，最右/最下方线程可能越界，inside 决定是否计算和写回。
+ 	uint32_t pix_id = W * pix.y + pix.x;
+ 	float2 pixf = { (float)pix.x, (float)pix.y };
+ 
+ 	// Check if this thread is associated with a valid pixel or outside.
+ 	bool inside = pix.x < W&& pix.y < H;
+ 	// Done threads can help with fetching, but don't rasterize
++	// 越界线程也不能提前退出整个函数，因为后面有块内同步和集体搬运。
++	// 它们只跳过像素计算，仍参与共享内存加载与屏障，避免部分线程退出造成同步问题。
+ 	bool done = !inside;
+ 
+ 	// Load start/end range of IDs to process in bit sorted list.
++	// range 是当前块在排序后高斯列表里的 [起始,结束) 下标。
++	// 一轮最多搬运 BLOCK_SIZE 个高斯；rounds 向上取整，最后一轮用 toDo 限制有效数量。
+ 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+ 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+ 	int toDo = range.y - range.x;
+@@ -312,6 +403,9 @@
+ 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+ 
+ 	// Initialize helper variables
++	// T 表示当前像素到达下一层前剩余的透射率，初始无遮挡时为 1。
++	// C 累计已经接受的颜色；权重为 w_i=α_i·T_i，T_i=Π_{j<i}(1-α_j)。
++	// contributor 是访问列表的位置计数，last_contributor 记录最后一个真正被合成的列表位置。
+ 	float T = 1.0f;
+ 	uint32_t contributor = 0;
+ 	uint32_t last_contributor = 0;
+@@ -323,11 +417,15 @@
+ 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+ 	{
+ 		// End if entire block votes that it is done rasterizing
++		// 屏障后统计整个块已有多少线程停止；全部停止才可以结束这个块的加载循环。
++		// 有些像素很早就不透明，有些仍需要更后面的高斯，因此不能仅凭单线程状态让整个块返回。
+ 		int num_done = __syncthreads_count(done);
+ 		if (num_done == BLOCK_SIZE)
+ 			break;
+ 
+ 		// Collectively fetch per-Gaussian data from global to shared
++		// 每条线程负责加载该批中的一个高斯，形成连续的全局内存访问。
++		// block.sync() 保证整个批次写入共享内存之后，任一像素线程才开始读取。
+ 		int progress = i * BLOCK_SIZE + block.thread_rank();
+ 		if (range.x + progress < range.y)
+ 		{
+@@ -347,8 +445,12 @@
+ 			// Resample using conic matrix (cf. "Surface 
+ 			// Splatting" by Zwicker et al., 2001)
+ 			float2 xy = collected_xy[j];
++			// d 是「高斯投影中心减像素位置」，以像素为单位；椭圆没有进行概率密度归一化。
++			// 因为高斯对 d 的二次型在变号后不变，前向颜色不受这一定义方向影响，但反向位置梯度会受影响。
+ 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+ 			float4 con_o = collected_conic_opacity[j];
++			// power=-0.5*dᵀΣ⁻¹d，应当非正；交叉项有两份，所以代码外写 -B*dx*dy。
++			// 如果得到正值，源码直接跳过这一对像素/高斯，用来避开不合理的指数增长。
+ 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+ 			if (power > 0.0f)
+ 				continue;
+@@ -357,9 +459,15 @@
+ 			// Obtain alpha by multiplying with Gaussian opacity
+ 			// and its exponential falloff from mean.
+ 			// Avoid numerical instabilities (see paper appendix). 
++			// 有效 α=不透明度×exp(power)，再限到 0.99；它表示该高斯对此像素的覆盖强度。
++			// 0.99 避免后续反向 T/(1-α) 发生除零；α<1/255 的贡献直接略去以节省计算。
++			// 此阈值是工程近似，跳过的分支不会产生该像素对该高斯的梯度。
+ 			float alpha = min(0.99f, con_o.w * exp(power));
+ 			if (alpha < 1.0f / 255.0f)
+ 				continue;
++			// 试算加入当前高斯后的透射率；若低于 1e-4，像素被标记结束。
++			// 注意顺序：源码在颜色累加之前 continue，因此触发终止的这个高斯本身也没有被合成。
++			// 保存的 T 仍是接受最后一个贡献者后的值，反向必须使用同样的截断边界。
+ 			float test_T = T * (1 - alpha);
+ 			if (test_T < 0.0001f)
+ 			{
+@@ -368,9 +476,14 @@
+ 			}
+ 
+ 			// Eq. (3) from 3D Gaussian splatting paper.
++			// 按从近到远的顺序累积 C += c_i·α_i·T_i，这是带遮挡的透明度合成。
++			// 前面的高斯减小后面所有高斯的权重；因此对 α 求导不能只考虑当前项。
+ 			for (int ch = 0; ch < CHANNELS; ch++)
+ 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+ 
++			// 逆深度图使用相同权重累计 Σ_i (1/z_i)·α_i·T_i。
++			// 它没有除以 Σ_i α_i·T_i，也不是 1/(Σ_i z_i·α_i·T_i)；背景逆深度在这里视作零。
++			// 变量名 expected_invdepth 不意味着已经条件归一化，使用深度损失时应认清这个定义。
+ 			if(invdepth)
+ 			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
+ 
+@@ -378,6 +491,8 @@
+ 
+ 			// Keep track of last range entry to update this
+ 			// pixel.
++			// 保存的是当前块列表的访问序号，包含前面被跳过的项，因此它不是「实际有效高斯数量」。
++			// 反向据此忽略位于最后一次合成之后的高斯，再重算各项阈值以恢复对应关系。
+ 			last_contributor = contributor;
+ 		}
+ 	}
+@@ -386,9 +501,13 @@
+ 	// rendering data to the frame and auxiliary buffers.
+ 	if (inside)
+ 	{
++		// 只保存最终透射率和最后贡献者位置，避免为每个像素保存完整的逐高斯合成历史。
++		// 反向可以从后往前用除以 (1-α) 重建中间透射率，这是节省显存的关键。
+ 		final_T[pix_id] = T;
+ 		n_contrib[pix_id] = last_contributor;
+ 		for (int ch = 0; ch < CHANNELS; ch++)
++			// 背景只乘剩余透射率：像素完全无遮挡时输出背景，前景不透明时背景影响很小。
++			// 输出并未自动截断到 [0,1]；它仍是可供损失函数求导的浮点颜色。
+ 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+ 
+ 		if (invdepth)
+@@ -396,6 +515,8 @@
+ 	}
+ }
+ 
++// 宿主侧包装函数负责发起 CUDA 核；模板通道数在编译时确定，可让通道循环展开。
++// 这里只启动异步工作，调试同步与错误报告由上层 CHECK_CUDA 控制。
+ void FORWARD::render(
+ 	const dim3 grid, dim3 block,
+ 	const uint2* ranges,
+@@ -426,6 +547,8 @@
+ 		depth);
+ }
+ 
++// 预处理核使用一维 256 线程块，与渲染时二维 16×16 像素块是不同的工作划分。
++// 形参很长时可按组阅读：输入几何/外观 → 相机 → 输出缓存 → 网格与控制开关。
+ void FORWARD::preprocess(int P, int D, int M,
+ 	const float* means3D,
+ 	const glm::vec3* scales,
+diff --git a/cuda_rasterizer/forward.h b/cuda_rasterizer/forward.h
+--- a/cuda_rasterizer/forward.h
++++ b/cuda_rasterizer/forward.h
+@@ -18,9 +18,14 @@
+ #define GLM_FORCE_CUDA
+ #include <glm/glm.hpp>
+ 
++// 中文精读：前向的两个阶段接口。preprocess 按高斯计算，render 按屏幕块/像素计算。
++// preprocess 产生 means2D、深度、半径、逆协方差和块覆盖数；排序由 rasterizer_impl.cu 在中间完成。
++// render 接收已排序列表，输出颜色、逆深度及反向所需的最终 T 和最后贡献者。
+ namespace FORWARD
+ {
+ 	// Perform initial steps for each Gaussian prior to rasterization.
++	// 输入分组：几何与外观参数 → 相机与图像参数 → 逐高斯输出 → 网格与控制开关。
++	// P/D/M 是高斯数量/球谐阶数/系数容量，二维协方差单位为像素²。
+ 	void preprocess(int P, int D, int M,
+ 		const float* orig_points,
+ 		const glm::vec3* scales,
+@@ -49,6 +54,8 @@
+ 		bool antialiasing);
+ 
+ 	// Main rasterization method.
++	// ranges 指定每块在 point_list 中的半开区间；features 是每高斯颜色，不是逐像素图。
++	// final_T 与 n_contrib 保留逆序重建所需信息；depths 是高斯中心 z，depth 输出实际是逆深度图。
+ 	void render(
+ 		const dim3 grid, dim3 block,
+ 		const uint2* ranges,
+diff --git a/cuda_rasterizer/rasterizer.h b/cuda_rasterizer/rasterizer.h
+--- a/cuda_rasterizer/rasterizer.h
++++ b/cuda_rasterizer/rasterizer.h
+@@ -17,6 +17,8 @@
+ 
+ namespace CudaRasterizer
+ {
++	// 中文精读：纯 CUDA 光栅器的宿主接口，把算法与 PyTorch 桥接解耦。
++	// 上层负责提供有效指针、图像尺寸和缓存分配回调；forward 返回高斯/块重叠实例总数。
+ 	class Rasterizer
+ 	{
+ 	public:
+@@ -28,6 +30,9 @@
+ 			float* projmatrix,
+ 			bool* present);
+ 
++		// 三个回调按需返回可用字节内存；P/D/M 分别为高斯数、当前球谐阶数、球谐容量。
++		// 预计算颜色与球谐二选一，预计算协方差与尺度/旋转二选一。
++		// 输出 depth 在此版本实际存的是加权逆深度，不能仅按变量名称理解为普通深度。
+ 		static int forward(
+ 			std::function<char* (size_t)> geometryBuffer,
+ 			std::function<char* (size_t)> binningBuffer,
+@@ -54,6 +59,9 @@
+ 			int* radii = nullptr,
+ 			bool debug = false);
+ 
++		// 复用前向缓存与 R，从像素上游梯度求每高斯属性梯度。
++		// dL_dmean2D、dL_dconic、dL_dcolor 等既是反向中间量，也部分作为 Python 输入梯度输出。
++		// 输入相机和排序路径保持固定；本接口没有对相机标定或离散排序输出导数。
+ 		static void backward(
+ 			const int P, int D, int M, int R,
+ 			const float* background,
+diff --git a/cuda_rasterizer/rasterizer_impl.cu b/cuda_rasterizer/rasterizer_impl.cu
+--- a/cuda_rasterizer/rasterizer_impl.cu
++++ b/cuda_rasterizer/rasterizer_impl.cu
+@@ -9,6 +9,10 @@
+  * For inquiries contact  george.drettakis@inria.fr
+  */
+ 
++// 中文精读：本文件把各个 CUDA 核组织成完整前向与反向流水线。
++// 前向：逐高斯预处理 → 覆盖块数前缀和 → 高斯/块实例复制 → 按块和深度排序 → 逐块合成。
++// 反向：复用排序与缓存 → 逐像素逆序反传 → 逐高斯把二维属性梯度传回三维参数。
++// P 是原始高斯数；R/num_rendered 是复制后的高斯与块重叠实例数，两者通常不同。
+ #include "rasterizer_impl.h"
+ #include <iostream>
+ #include <fstream>
+@@ -32,6 +36,8 @@
+ 
+ // Helper function to find the next-highest bit of the MSB
+ // on the CPU.
++// 估计表示块编号所需的高位位数，供基数排序指定有效位范围。
++// 排序键低 32 位始终用于深度，高位只有块编号需要的若干位有意义，无需总排序完整 64 位。
+ uint32_t getHigherMsb(uint32_t n)
+ {
+ 	uint32_t msb = sizeof(n) * 4;
+@@ -51,6 +57,8 @@
+ 
+ // Wrapper method to call auxiliary coarse frustum containment test.
+ // Mark all Gaussians that pass it.
++// 一线程一高斯，调用共享粗筛函数写 bool；只判断几何筛选，不处理遮挡。
++// 此路径用于 Python markVisible，核心前向自己也会做相同近裁剪检查。
+ __global__ void checkFrustum(int P,
+ 	const float* orig_points,
+ 	const float* viewmatrix,
+@@ -67,6 +75,9 @@
+ 
+ // Generates one key/value pair for all Gaussian / tile overlaps. 
+ // Run once per Gaussian (1:N mapping).
++// 一个高斯可能覆盖多个屏幕块，为每次重叠生成一条 (排序键,高斯编号)。
++// 这里只复制索引与键，不复制完整高斯参数；渲染阶段仍通过编号读取原属性数组。
++// 前缀和已经给每个高斯分配独占写入区间，因此写实例数组不需要原子加法。
+ __global__ void duplicateWithKeys(
+ 	int P,
+ 	const float2* points_xy,
+@@ -85,6 +96,9 @@
+ 	if (radii[idx] > 0)
+ 	{
+ 		// Find this Gaussian's offset in buffer for writing keys/values.
++		// InclusiveSum 的第 i 项是截至 i 的覆盖块总数，所以第 i 个高斯起点取 offsets[i-1]。
++		// 例如覆盖数 [2,3,0,2] → 前缀和 [2,5,5,7]，四个写入区间为 [0,2)、[2,5)、[5,5)、[5,7)。
++		// 不可见高斯半径为零，对应空区间，不生成任何键。
+ 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+ 		uint2 rect_min, rect_max;
+ 
+@@ -99,8 +113,14 @@
+ 		{
+ 			for (int x = rect_min.x; x < rect_max.x; x++)
+ 			{
++				// 高 32 位编码行优先块编号 tile_id=y*grid.x+x，低 32 位编码中心深度的浮点位模式。
++				// 正有限浮点数的 IEEE 754 位模式按无符号整数排序时与数值顺序一致；近裁剪确保有效深度为正。
++				// 若改成允许负深度或特殊 NaN 值，不能继续直接使用这套位排序技巧。
+ 				uint64_t key = y * grid.x + x;
+ 				key <<= 32;
++				// 这里读取 float 的原始 32 位表示，不是把深度数值转换成整数。
++				// 排序后先聚合同块实例，再在块内按深度从小到大排，实现前向需要的近到远合成顺序。
++				// 这是高斯中心深度排序，不是对每个像素分别做精确几何排序。
+ 				key |= *((uint32_t*)&depths[idx]);
+ 				gaussian_keys_unsorted[off] = key;
+ 				gaussian_values_unsorted[off] = idx;
+@@ -113,6 +133,8 @@
+ // Check keys to see if it is at the start/end of one tile's range in 
+ // the full sorted list. If yes, write start/end of this tile. 
+ // Run once per instanced (duplicated) Gaussian ID.
++// 排序后同一块的实例已连续，只需检测相邻键的高位何时变化。
++// 每个线程检查一个实例边界，写出该块在 point_list 中的半开 [start,end) 区间。
+ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
+ {
+ 	auto idx = cg::this_grid().thread_rank();
+@@ -127,6 +149,8 @@
+ 	else
+ 	{
+ 		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
++		// 发生块编号变化时，当前位置同时是前一块的结束和当前块的开始。
++		// 首项/末项需要单独设置边界；没有实例的块此前已清零，因此其区间保持 [0,0)。
+ 		if (currtile != prevtile)
+ 		{
+ 			ranges[prevtile].y = idx;
+@@ -152,9 +176,15 @@
+ 		present);
+ }
+ 
++// 把一整块字节显存按固定顺序切成多个类型化数组，每个起点按 128 字节对齐。
++// 这里主要做指针布局与 CUB 临时空间查询，不逐元素初始化数据。
++// 同样的布局函数在反向重新调用，必须保持字段次序、P 和对齐约定完全一致。
+ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
+ {
+ 	GeometryState geom;
++	// GeometryState 按高斯保存：深度、颜色截断标记、半径、二维中心、六项协方差、
++	// 逆协方差+有效不透明度、RGB、覆盖块数、前缀和与扫描临时空间。
++	// 上层训练增密会改变 P，缓冲区因而通过回调动态重新分配。
+ 	obtain(chunk, geom.depths, P, 128);
+ 	obtain(chunk, geom.clamped, P * 3, 128);
+ 	obtain(chunk, geom.internal_radii, P, 128);
+@@ -163,12 +193,16 @@
+ 	obtain(chunk, geom.conic_opacity, P, 128);
+ 	obtain(chunk, geom.rgb, P * 3, 128);
+ 	obtain(chunk, geom.tiles_touched, P, 128);
++	// CUB 的第一种调用传空临时空间，只查询需要多少工作区字节，不执行真正扫描。
++	// 拿到 scan_size 后再分配空间，前向后面以非空指针再次调用才完成计算。
+ 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
+ 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
+ 	obtain(chunk, geom.point_offsets, P, 128);
+ 	return geom;
+ }
+ 
++// 像素缓存按 N=宽×高分配；accum_alpha 名字容易误导，实际保存最终透射率 T。
++// n_contrib 保存最后贡献者位置；ranges 语义上按屏幕块使用，源码这里按像素数预留了更大的容量。
+ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
+ {
+ 	ImageState img;
+@@ -178,6 +212,8 @@
+ 	return img;
+ }
+ 
++// 这里的 P 是传入的实例数量，含同一高斯对多个块的重复条目。
++// 同时分配排序前/后键和值数组，再询问 CUB 基数排序所需临时空间。
+ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
+ {
+ 	BinningState binning;
+@@ -195,6 +231,8 @@
+ 
+ // Forward rendering procedure for differentiable rasterization
+ // of Gaussians.
++// 顶层前向只负责调度，计算细节在 forward.cu。
++// 三个 Buffer 回调来自 PyTorch 字节张量，既允许 CUDA 动态申请空间，又使缓存生命周期由张量管理。
+ int CudaRasterizer::Rasterizer::forward(
+ 	std::function<char* (size_t)> geometryBuffer,
+ 	std::function<char* (size_t)> binningBuffer,
+@@ -221,18 +259,26 @@
+ 	int* radii,
+ 	bool debug)
+ {
++	// 半视场角满足 tan(FoV/2)=(图像尺寸/2)/焦距，所以 fy=height/(2*tan_fovy)。
++	// 焦距单位为像素，与协方差投影和像素位置保持一致；tanfov 参数并非完整 FoV 的正切值。
+ 	const float focal_y = height / (2.0f * tan_fovy);
+ 	const float focal_x = width / (2.0f * tan_fovx);
+ 
++	// 先通过相同布局函数估算所需字节，再让回调扩容，最后在真实指针上划分字段。
++	// 这种设计避免为每个中间数组单独向 PyTorch/驱动申请显存。
+ 	size_t chunk_size = required<GeometryState>(P);
+ 	char* chunkptr = geometryBuffer(chunk_size);
+ 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+ 
++	// 调用者可提供半径输出；没有时使用内部缓存。
++	// 正常 Python 路径需要 radii 给训练统计使用，所以通常传入单独的整数张量。
+ 	if (radii == nullptr)
+ 	{
+ 		radii = geomState.internal_radii;
+ 	}
+ 
++	// 屏幕按 BLOCK_X×BLOCK_Y 切块，宽高分别向上取整，最后一排/列由 inside 掩码处理越界。
++	// block 的二维线程布局恰好对应一个屏幕块内的像素坐标。
+ 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+ 	dim3 block(BLOCK_X, BLOCK_Y, 1);
+ 
+@@ -247,6 +293,8 @@
+ 	}
+ 
+ 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
++	// 第一步：逐高斯计算投影椭圆、颜色、深度、半径及覆盖块数。
++	// 此时只知道每个高斯要复制多少条实例，还没有确定它们在总列表中的位置。
+ 	CHECK_CUDA(FORWARD::preprocess(
+ 		P, D, M,
+ 		means3D,
+@@ -277,10 +325,15 @@
+ 
+ 	// Compute prefix sum over full list of touched tile counts by Gaussians
+ 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
++	// 第二步：对每个高斯的覆盖块数做包含自身的前缀和，得到独占写入区间。
++	// 复杂度主要随高斯数 P 增长；这比对每次重叠都做全局原子分配更适合批量 GPU 处理。
+ 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+ 
+ 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
+ 	int num_rendered;
++	// 前缀和最后一项等于实例总数 R，把这个单值从 GPU 拷回 CPU，用来分配排序缓冲区。
++	// 这一步引入主机/设备依赖，是该流水线中的同步点；R 不等于实际有贡献的像素数或高斯数。
++	// 底层假定 P>0；外层 rasterize_points.cu 用 if(P!=0) 保护这里的 P-1 访问。
+ 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+ 
+ 	size_t binning_chunk_size = required<BinningState>(num_rendered);
+@@ -289,6 +342,8 @@
+ 
+ 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
+ 	// and corresponding dublicated Gaussian indices to be sorted
++	// 第三步：按已分配的区间生成所有块/深度键与原高斯编号。
++	// 后续排序只重排这些轻量实例，不修改训练中的高斯参数顺序。
+ 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+ 		P,
+ 		geomState.means2D,
+@@ -303,6 +358,9 @@
+ 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+ 
+ 	// Sort complete list of (duplicated) Gaussian indices by keys
++	// 第四步：基数排序按键升序，同时携带对应高斯编号进行相同重排。
++	// 有效位范围为 [0,32+bit)，包含全部深度位和足够的块编号位。
++	// 得到的列表可直接被各屏幕块独立读取，无需像素线程再自行排序。
+ 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+ 		binningState.list_sorting_space,
+ 		binningState.sorting_size,
+@@ -310,9 +368,13 @@
+ 		binningState.point_list_unsorted, binningState.point_list,
+ 		num_rendered, 0, 32 + bit), debug)
+ 
++	// 所有块区间先清零；只对实际出现实例的块写 start/end。
++	// 这样空块也可以正常进入渲染核，其 range 长度为零，最后直接输出背景色。
+ 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+ 
+ 	// Identify start and end of per-tile workloads in sorted list
++	// R=0 时不启动零工作量的范围识别核；颜色渲染仍启动，以便为空场景块写背景。
++	// 请区分「P>0 但全部被剔除」与 C++ 外层「P=0」分支，后者直接保留初始化的输出零值。
+ 	if (num_rendered > 0)
+ 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+ 			num_rendered,
+@@ -321,6 +383,8 @@
+ 	CHECK_CUDA(, debug)
+ 
+ 	// Let each tile blend its range of Gaussians independently in parallel
++	// 颜色来源二选一：上层预计算颜色，或预处理核已写好的球谐颜色。
++	// 无论来源如何，像素合成核都把它当每高斯的 CHANNELS 个特征值来处理。
+ 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+ 	CHECK_CUDA(FORWARD::render(
+ 		tile_grid, block,
+@@ -337,11 +401,15 @@
+ 		geomState.depths,
+ 		depth), debug)
+ 
++	// 返回 R 供 Python 保存到 autograd 上下文，反向才能重建 BinningState 的同样布局。
++	// 它是缓存大小信息，而不是用于计算损失的可微输出。
+ 	return num_rendered;
+ }
+ 
+ // Produce necessary gradients for optimization, corresponding
+ // to forward render pass
++// 反向不重新做分块与排序，直接复用前向的三个缓存，保证对同一条离散计算路径求导。
++// 可微的几何和颜色中间量可按需重算，离散决定则沿用前向结果。
+ void CudaRasterizer::Rasterizer::backward(
+ 	const int P, int D, int M, int R,
+ 	const float* background,
+@@ -377,6 +445,8 @@
+ 	bool antialiasing,
+ 	bool debug)
+ {
++	// 这里仅把缓存字节重新解释为字段指针，并非重新跑一遍前向。
++	// P、R、图像宽高必须对应同一帧，否则布局偏移和数据含义都会错位。
+ 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
+ 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
+ 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+@@ -396,6 +466,8 @@
+ 	// opacity and RGB of Gaussians from per-pixel loss gradients.
+ 	// If we were given precomputed colors and not SHs, use them.
+ 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
++	// 第一段反向从图像梯度得到每个高斯的二维位置、逆协方差、有效不透明度、颜色、逆深度梯度。
++	// 一个高斯被很多像素共享，所以这一段内部使用原子累加。
+ 	CHECK_CUDA(BACKWARD::render(
+ 		tile_grid,
+ 		block,
+@@ -420,6 +492,8 @@
+ 	// Take care of the rest of preprocessing. Was the precomputed covariance
+ 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
+ 	// use the one we computed ourselves.
++	// 第二段需要前向实际使用的三维协方差：要么来自上层输入，要么来自几何缓存。
++	// 然后依次反传矩阵求逆、投影雅可比、齐次中心、球谐与尺度/旋转。
+ 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
+ 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
+ 		(float3*)means3D,
+diff --git a/cuda_rasterizer/rasterizer_impl.h b/cuda_rasterizer/rasterizer_impl.h
+--- a/cuda_rasterizer/rasterizer_impl.h
++++ b/cuda_rasterizer/rasterizer_impl.h
+@@ -16,9 +16,14 @@
+ #include "rasterizer.h"
+ #include <cuda_runtime_api.h>
+ 
++// 中文精读：定义字节缓存内部的内存布局；这些结构只持有指针，不负责拥有或释放显存。
++// fromChunk 必须在前向和反向用同样的元素数调用，才能恢复一致的偏移。
+ namespace CudaRasterizer
+ {
+ 	template <typename T>
++	// 把当前地址向上对齐到 alignment 的整数倍，再划出 count 个 T 元素。
++	// 位运算 (地址+alignment-1)&~(alignment-1) 要求 alignment 是二的幂；这里使用 128。
++	// chunk 按引用更新为下一块起点，ptr 指向本字段首元素，这不是一次新显存分配。
+ 	static void obtain(char*& chunk, T*& ptr, std::size_t count, std::size_t alignment)
+ 	{
+ 		std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);
+@@ -26,6 +31,9 @@
+ 		chunk = reinterpret_cast<char*>(ptr + count);
+ 	}
+ 
++	// 按高斯组织的中间量：depths 是相机 z，means2D 是像素中心，cov3D 为六项对称协方差。
++	// conic_opacity 为逆二维协方差三项加有效 opacity；clamped 记录球谐颜色负值截断。
++	// tiles_touched 是覆盖块数量，point_offsets 是其包含自身的前缀和。
+ 	struct GeometryState
+ 	{
+ 		size_t scan_size;
+@@ -43,6 +51,8 @@
+ 		static GeometryState fromChunk(char*& chunk, size_t P);
+ 	};
+ 
++	// ranges 按块描述排序列表区间；n_contrib 按像素保存最后贡献者位置。
++	// accum_alpha 虽含 alpha 字样，实际保存的是最终透射率 T，不是累计不透明度 1-T。
+ 	struct ImageState
+ 	{
+ 		uint2* ranges;
+@@ -52,6 +62,8 @@
+ 		static ImageState fromChunk(char*& chunk, size_t N);
+ 	};
+ 
++	// 排序前后各保存一套键和值：64 位 key=[块编号|深度位模式]，32 位 value=原高斯编号。
++	// 数组长度是重叠实例数 R；一个高斯覆盖多个块就会出现在多条 value 中。
+ 	struct BinningState
+ 	{
+ 		size_t sorting_size;
+@@ -65,6 +77,8 @@
+ 	};
+ 
+ 	template<typename T> 
++	// 使用相同 fromChunk 布局计算器在空基址上推进偏移，估计最终需要多少字节，再加 128 对齐余量。
++	// 这是固定源码的指针算术布局技巧；学习时可理解为「模拟排布」而不是读取空地址的数据。
+ 	size_t required(size_t P)
+ 	{
+ 		char* size = nullptr;
